@@ -9,6 +9,7 @@ import {
   defaultRules,
 } from "@crewpay/domain";
 import { FakeRail } from "@crewpay/rails";
+import { FakeSigner } from "@crewpay/signer";
 import { executeRun } from "./payrun.ts";
 
 const BASE_USDC = { chain: "base", asset: "usdc" } as const;
@@ -139,4 +140,65 @@ test("a pending settlement is polled to completion", async () => {
   );
   assert.equal(result.outcomes[0]?.settlement?.status, "settled");
   assert.equal(result.settledCents, 150_000);
+});
+
+test("with a signer, a settled payment carries the deposit proof", async () => {
+  const p = payee("ada");
+  const d = { ...deps([p]), signer: new FakeSigner() };
+  const result = await executeRun("org_1", policy(), [line("op_1", "ada", 150_000)], d);
+  assert.equal(result.settledCents, 150_000);
+  const funding = result.outcomes[0]?.funding;
+  assert.equal(funding?.kind, "deposited");
+  if (funding?.kind === "deposited") assert.equal(funding.proof.txHash, "0xdeposit_op_1");
+});
+
+test("a funding failure stops before submit and is reported as failed", async () => {
+  const p = payee("ada");
+  const d = {
+    ...deps([p]),
+    signer: new FakeSigner({ retryableFailureOperationIds: ["op_1"] }),
+  };
+  const result = await executeRun("org_1", policy(), [line("op_1", "ada", 150_000)], d);
+  assert.deepEqual(result.failed, ["op_1"]);
+  assert.equal(result.settledCents, 0);
+  assert.equal(result.outcomes[0]?.settlement, undefined);
+  assert.equal(result.outcomes[0]?.funding?.kind, "failed");
+});
+
+test("unknown fund state is escalated to needsReview, never to failed", async () => {
+  const p = payee("ada");
+  const d = { ...deps([p]), signer: new FakeSigner({ needsReviewOperationIds: ["op_1"] }) };
+  const result = await executeRun("org_1", policy(), [line("op_1", "ada", 150_000)], d);
+  assert.deepEqual(result.needsReview, ["op_1"]);
+  assert.deepEqual(result.failed, []);
+  assert.equal(result.settledCents, 0);
+  assert.equal(result.outcomes[0]?.settlement, undefined);
+});
+
+test("in-flight funding is escalated, not marked failed", async () => {
+  const p = payee("ada");
+  const d = { ...deps([p]), signer: new FakeSigner({ stuckOperationIds: ["op_1"] }) };
+  const result = await executeRun("org_1", policy(), [line("op_1", "ada", 150_000)], d);
+  assert.deepEqual(result.needsReview, ["op_1"]);
+  assert.deepEqual(result.failed, []);
+});
+
+test("a non-retryable funding failure is still reported as failed", async () => {
+  const p = payee("ada");
+  const d = { ...deps([p]), signer: new FakeSigner({ unsafeFailureOperationIds: ["op_1"] }) };
+  const result = await executeRun("org_1", policy(), [line("op_1", "ada", 150_000)], d);
+  assert.deepEqual(result.failed, ["op_1"]);
+  const funding = result.outcomes[0]?.funding;
+  assert.equal(funding?.kind, "failed");
+  if (funding?.kind === "failed") assert.equal(funding.safeToRetry, false);
+});
+
+test("a settlement still in flight after the poll budget is escalated", async () => {
+  const p = payee("ada");
+  // slow with more pending polls than the orchestrator's MAX_POLLS allows.
+  const d = { ...deps([p], { slowOperationIds: ["op_1"], pendingPolls: 999 }) };
+  const result = await executeRun("org_1", policy(), [line("op_1", "ada", 150_000)], d);
+  assert.deepEqual(result.needsReview, ["op_1"]);
+  assert.deepEqual(result.failed, []);
+  assert.equal(result.settledCents, 0);
 });

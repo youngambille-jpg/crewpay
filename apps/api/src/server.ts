@@ -2,11 +2,14 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { Operation, PayRunItem, Payee, Policy } from "@crewpay/domain";
 import { defaultRules, corridor } from "@crewpay/domain";
 import type { SettlementRail } from "@crewpay/rails";
+import type { Signer } from "@crewpay/signer";
 import { executeRun } from "@crewpay/agent";
 import { activePolicy, createStore, type Store } from "./store.ts";
 
 export interface ApiDeps {
   readonly rail: SettlementRail;
+  /** Funds the rail's deposit address. Without it, runs are unfunded. */
+  readonly signer?: Signer;
   readonly store?: Store;
 }
 
@@ -139,6 +142,7 @@ async function handle(
       items,
       {
         rail: deps.rail,
+        ...(deps.signer ? { signer: deps.signer } : {}),
         lookupPayee: (id) => store.payees.get(id),
         payeeHasHistory: (id) => (store.payeeHistory.get(id) ?? 0) > 0,
       },
@@ -157,7 +161,8 @@ async function handle(
       period: body.period,
       currency: body.currency ?? origin.asset,
       status:
-        result.denied.length + result.failed.length === 0 && result.awaitingApproval.length === 0
+        result.denied.length + result.failed.length + result.needsReview.length === 0 &&
+        result.awaitingApproval.length === 0
           ? ("settled" as const)
           : result.settledCents > 0
             ? ("partially_settled" as const)
@@ -174,6 +179,7 @@ async function handle(
       awaitingApproval: result.awaitingApproval,
       denied: result.denied,
       failed: result.failed,
+      needsReview: result.needsReview,
       total: total.toString(),
     });
   }

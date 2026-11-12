@@ -144,17 +144,68 @@ accounting exports.
 ### 3.5 `signer` — custody boundary (OutLayer)
 
 There is no private key in Crewpay. The org's treasury lives in an OutLayer
-TEE-held wallet. Crewpay:
+TEE-held wallet, and Crewpay holds only a `wk_` API key. Crewpay:
 
 1. submits the operation to the policy engine;
-2. on `allow`, asks OutLayer to sign/execute under the org's policy manifest;
+2. on `allow`, funds the rail's deposit address from the custody wallet;
 3. on `allow_with_approval`, opens an OutLayer task (owner inbox) and waits;
-4. records the attestation and transparency proof against the ledger entry.
+4. records the deposit proof against the ledger entry.
 
 OutLayer gives us TEE-held multi-chain wallets, a policy engine, multisig
 approvals, gasless payment checks, confidential NEAR Intents, and on-chain
 attestation. Crewpay's own policy engine runs *before* OutLayer's, so OutLayer
 is the second line of defence and the custody boundary.
+
+**Implemented (`packages/signer`).** `Signer` has two methods: `plan`, a pure
+decision about how a deposit will be funded, and `fund`, which executes it and
+returns a `FundingOutcome`. `OutLayerSigner` is the real one; `FakeSigner` is
+the offline one, and it reproduces every outcome variant so the orchestrator's
+handling of the hard cases is tested without a network.
+
+Two funding routes exist and they are not interchangeable:
+
+- **`intents`** — `POST /wallet/v1/intents/withdraw`, a gasless NEAR Intents
+  withdraw that delivers the origin asset to the rail's deposit address. Needs
+  no gas token and works from any origin chain.
+- **`onchain`** — `POST /wallet/v1/transfer` for native NEAR, or `POST
+  /wallet/v1/call` with `ft_transfer` for a NEP-141 token. Needs NEAR for gas,
+  and the recipient must have token storage registered.
+
+`plan` picks `intents` for any non-NEAR origin and `onchain` for a NEAR origin.
+
+**Funding is not a boolean.** `FundingOutcome` is a four-way union because the
+wrong choice retries a payment that may already have moved:
+
+| Outcome | Meaning | Caller action |
+|---|---|---|
+| `deposited` | Broadcast; carries the proof | Hand the proof to `submit` |
+| `pending` | In flight or awaiting multisig | Leave unsettled; resolve later |
+| `failed` | Did not complete; `safeToRetry` says whether funds could have moved | Retry only when `safeToRetry` |
+| `needs_review` | Fund state **unknown** | Escalate to a human; never auto-retry |
+
+The classification follows the service's own semantics: `failed` is retryable
+only when `result.never_executed` or `result.never_submitted` is set, since a
+bridge failure or refund may otherwise have moved funds; `needs_review`,
+`rejected`, and `refunded` are mapped explicitly. The terminal-status set is
+kept exact — no invented synonyms — so nothing silently falls through.
+
+**Proof is the delivery tx, not the intent hash.** On the `intents` route the
+only real transaction is `result.destination_tx_hash`; `transfer_intent_hash`
+and `intent_hash` are solver-relay identifiers, not chain transactions. On the
+`onchain` route it is `result.tx_hash`. A `success` that returns no identifier
+is escalated to `needs_review` rather than reported as funded.
+
+**Idempotency.** Every state-changing call carries an `X-Idempotency-Key`
+derived from the operation id, so a retry after a timeout sends the same key
+and the server answers with the original request. The duplicate arrives as HTTP
+200 with `error: duplicate_idempotency_key`, not a 4xx, so it is detected
+explicitly. `X-Answer-Within` bounds the synchronous wait, so a slow settlement
+answers with a request id to poll instead of holding the connection open.
+
+**Polling.** `processing` and `pending_deposit` are polled to a terminal
+status. `pending_approval` is deliberately *not* polled: a multisig wallet
+settles it only when a human votes, so polling would spin until a false
+escalation.
 
 ### 3.6 `store` — Postgres
 
@@ -297,15 +348,20 @@ at `https://1click.chaindefuser.com/docs/v0/openapi.yaml`.
 
 ## 7. Security model
 
-- **No keys in Crewpay.** Signing happens in the TEE; Crewpay holds only
-  references. Compromise of the app server cannot move funds.
+- **No keys in Crewpay.** Signing happens in the TEE; Crewpay holds only a
+  `wk_` API key. Compromise of the app server cannot extract a key, and the
+  enclave re-checks the wallet's on-chain policy before every signature.
 - **Two independent policy layers.** Crewpay's deterministic engine, then
   OutLayer's manifest. A bug in one does not by itself authorize a payment.
 - **Defence against prompt injection.** The LLM planner cannot sign and cannot
   reach rails. Its output is a proposal that must pass policy, so a hijacked
   prompt can at worst propose a denied operation.
-- **Idempotency.** Every operation carries a deterministic id; deposits and
-  submissions are idempotent so retries cannot double-pay.
+- **Idempotency.** Every operation carries a deterministic id, and the signer
+  derives its `X-Idempotency-Key` from it, so a retry after a timeout returns
+  the original request instead of moving funds twice.
+- **Unknown fund state is never retried.** A funding failure is retried only
+  when the service says no funds moved; anything unresolved is escalated to a
+  human, because a blind retry can double-spend.
 - **Least privilege.** API keys are scoped (`read`, `payroll:write`,
   `approvals:write`). Approvals require an `approver` member.
 - **Auditability.** Decisions store the policy version; receipts link to chain
@@ -332,11 +388,15 @@ agent worker (Node)  ─┘        │
 3. **`api` skeleton** — orgs, payees, pay runs, approvals; wired to policy/ledger.
 4. **`agent` worker** — start with a fake rail adapter, then swap in 1Click.
 5. **1Click integration** — quote → sign → submit → status, with refunds.
-6. **OutLayer integration** — TEE wallet, policy manifest, tasks for approvals.
-7. **PingPay integration** — invoice checkout + webhook → auto pay run.
-8. **Agent payees** — x402/MPP per-task settlement + 1099-style export.
-9. **Treasury** — Earn, limit orders, sweeps.
-10. **Accounting exports** — QuickBooks/Xero sync, attestation bundle.
+6. **Signer (`packages/signer`)** — OutLayer TEE wallet funds the deposit and
+   returns a `DepositProof`; four-way funding outcome so a retry never
+   double-pays.
+7. **OutLayer policy manifest + approval tasks** — the org policy as an on-chain
+   manifest, multisig inbox for `allow_with_approval`.
+8. **PingPay integration** — invoice checkout + webhook → auto pay run.
+9. **Agent payees** — x402/MPP per-task settlement + 1099-style export.
+10. **Treasury** — Earn, limit orders, sweeps.
+11. **Accounting exports** — QuickBooks/Xero sync, attestation bundle.
 
 ## 10. Deliberately out of scope (v1)
 

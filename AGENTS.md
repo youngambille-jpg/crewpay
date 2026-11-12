@@ -65,7 +65,10 @@ There is no build step. There are no runtime dependencies in the core packages.
 - `packages/ledger` — pure journal constructors. No I/O.
 - `packages/rails` — `SettlementRail` interface + adapters (`FakeRail`,
   `OneClickRail`) and `AssetRegistry`. Network only here.
-- `apps/agent` — orchestration (`executeRun`): policy → rail → ledger.
+- `packages/signer` — `Signer` interface + adapters (`FakeSigner`,
+  `OutLayerSigner`) and the OutLayer HTTP client. Holds the `wk_` API key;
+  never a private key.
+- `apps/agent` — orchestration (`executeRun`): policy → signer → rail → ledger.
 - `apps/api` — control plane over `node:http`, in-memory store. Owns org state,
   never moves money itself.
 
@@ -86,9 +89,47 @@ There is no build step. There are no runtime dependencies in the core packages.
 - `EXACT_OUTPUT` means `amount` is the destination amount; `amountIn` comes back
   with a slippage buffer and is refunded if unused.
 
+## OutLayer signer notes
+
+- Skill of record: `https://skills.outlayer.ai/agent-custody/SKILL.md` and its
+  `references/` (fetched with curl; the docs site is JS-heavy, the skill files
+  are plain Markdown). Base URL `https://api.outlayer.ai`.
+- Auth is `Authorization: Bearer wk_...`. There is no `X-API-Key` here — that is
+  1Click. Both are live in this repo; do not cross the headers.
+- **Funding is not a boolean.** `fund` returns a four-way `FundingOutcome`
+  (`deposited` | `pending` | `failed` | `needs_review`). `failed.safeToRetry` is
+  true only when the service sets `result.never_executed`/`never_submitted`; a
+  bridge failure or refund may otherwise have moved funds. `needs_review` means
+  unknown state — escalate, never auto-retry. Retrying unknown state double-pays.
+- The terminal status set is exact: `success | failed | needs_review | rejected
+  | refunded`. Do not invent `settled`/`completed`/`confirmed`. Poll only
+  `processing` and `pending_deposit`; `pending_approval` settles only when a
+  human votes, so polling it spins until a false escalation.
+- A duplicate idempotency key is HTTP **200** with
+  `error: duplicate_idempotency_key`, not a 4xx. Detect it by the body field.
+  Keys are scoped to `(wallet, key)` and derived from the operation id, so a
+  retry sends the same key. Never reuse one key across two operations.
+- On the intents route the real tx is `result.destination_tx_hash` — **not**
+  `transfer_intent_hash`/`intent_hash`, which are solver-relay identifiers. On
+  the on-chain route it is `result.tx_hash`.
+- Two funding routes: `intents` (`POST /wallet/v1/intents/withdraw`, gasless,
+  any origin chain) and `onchain` (`POST /wallet/v1/transfer` for native NEAR,
+  `POST /wallet/v1/call` with `ft_transfer` for NEP-141). `plan` picks intents
+  for non-NEAR origins.
+- **Strip-only-mode trap (hit twice now).** Node runs `.ts` by type stripping,
+  so TS parameter properties (`constructor(private x: T)`) and `enum` are
+  unsupported and throw `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX`. Declare class
+  fields and assign in the body. `tsc` does not catch this — only `npm test`
+  does, so run tests, not just `typecheck`.
+- A new workspace package needs its `package.json` present **before**
+  `npm install`, or npm cannot resolve it and tries the registry (404). After
+  adding one, re-run `npm install` to create the `node_modules/@crewpay/*`
+  symlink, and confirm `tsc` resolves the import.
+
 ## Status
 
 Done and tested: `domain`, `policy`, `ledger`, `rails` (incl. 1Click adapter),
-agent orchestration, api skeleton. 49 tests.
-Not started: the signer that broadcasts deposits, OutLayer signing, PingPay,
-x402/MPP agent payouts, Postgres persistence, web UI.
+`signer` (OutLayer TEE custody + FakeSigner), agent orchestration, api skeleton.
+82 tests.
+Not started: OutLayer policy manifest + approval tasks, PingPay, x402/MPP agent
+payouts, Postgres persistence, web UI.

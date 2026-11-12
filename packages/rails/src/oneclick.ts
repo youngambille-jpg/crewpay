@@ -11,8 +11,9 @@ const CHAIN_ALIASES: Record<string, string> = {
   bitcoin: "btc",
 };
 
-function chainCode(ca: ChainAsset): string {
-  return CHAIN_ALIASES[ca.chain.toLowerCase()] ?? ca.chain.toLowerCase();
+/** Map a chain name to 1Click's code (`ethereum` -> `eth`, `solana` -> `sol`). */
+export function chainCode(chain: string): string {
+  return CHAIN_ALIASES[chain.toLowerCase()] ?? chain.toLowerCase();
 }
 
 /** 1Click status vocabulary, from `GetExecutionStatusResponse.status`. */
@@ -127,7 +128,7 @@ export class OneClickRail implements SettlementRail {
   }
 
   private assetId(ca: ChainAsset): string {
-    return this.cfg.registry.require(chainCode(ca), ca.asset).assetId;
+    return this.cfg.registry.require(chainCode(ca.chain), ca.asset).assetId;
   }
 
   async quote(op: Operation): Promise<Quote> {

@@ -37,15 +37,17 @@ No build step and no runtime dependencies are needed for the core packages.
 
 ```bash
 npm install        # links the workspace packages
-npm test           # 49 tests across policy, ledger, rails, agent and api
-npm run demo       # end-to-end pay run against the FakeRail
+npm test           # 82 tests across policy, ledger, rails, signer, agent and api
+npm run demo       # end-to-end pay run against the FakeRail + FakeSigner
+npm run test:signer    # signer outcome and idempotency tests only
 npm run verify:tokens  # check the pinned asset table against live 1Click
 npm run typecheck  # strict tsc, no emit
 ```
 
-The demo seeds four payees and runs one pay run. Expected result: two
-contractors settle, one vendor over the approval threshold goes to approval, and
-one agent payee over the per-kind cap is denied.
+The demo seeds four payees and runs one pay run. Expected result: one contractor
+settles (with a deposit proof), one operation's funding is escalated to
+`needsReview`, one vendor over the approval threshold goes to approval, and one
+agent payee over the per-kind cap is denied.
 
 ## Design rules
 
@@ -54,7 +56,7 @@ one agent payee over the per-kind cap is denied.
 2. **The agent proposes, policy disposes.** No money moves without a
    deterministic policy decision recorded against a policy version.
 3. **No keys in Crewpay.** Signing happens in a TEE (OutLayer); this codebase
-   holds references, not secrets.
+   holds a `wk_` API key, not secrets.
 4. **Everything reconciles.** Every settlement writes a balanced journal entry
    linked to on-chain evidence.
 
@@ -64,8 +66,10 @@ one agent payee over the per-kind cap is denied.
 2. `api` and `agent` skeletons — done.
 3. `OneClickRail` against the live 1Click API — done (spec-accurate, tested
    against recorded fixtures, asset table drift-guarded).
-4. Signer: broadcast the deposit and pass a `DepositProof` to `submit`.
-5. OutLayer integration: TEE wallet, policy manifest, approval tasks.
+4. `signer`: OutLayer TEE custody funds the deposit and passes a `DepositProof`
+   to `submit` — done (`packages/signer`, four-way funding outcome, idempotent).
+5. OutLayer policy manifest: the org policy as an on-chain manifest, approval
+   tasks for `allow_with_approval`.
 6. PingPay integration: invoice checkout + webhook → auto pay run.
 7. Agent payees via x402/MPP per-task settlement.
 8. Treasury: Earn, limit orders, sweeps. Accounting exports.

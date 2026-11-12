@@ -5,10 +5,14 @@
  */
 import type { AddressInfo } from "node:net";
 import { FakeRail } from "@crewpay/rails";
+import { FakeSigner } from "@crewpay/signer";
 import { defaultRules } from "@crewpay/domain";
 import { createApi } from "./server.ts";
 
-const { server } = createApi({ rail: new FakeRail({ slowOperationIds: ["run_1_op_3"] }) });
+const { server } = createApi({
+  rail: new FakeRail({ slowOperationIds: ["run_1_op_3"] }),
+  signer: new FakeSigner({ needsReviewOperationIds: ["run_1_op_2"] }),
+});
 
 await new Promise<void>((resolve) => server.listen(0, resolve));
 const port = (server.address() as AddressInfo).port;

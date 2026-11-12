@@ -8,6 +8,7 @@
     "@crewpay/domain": "0.0.0",
     "@crewpay/policy": "0.0.0",
     "@crewpay/ledger": "0.0.0",
-    "@crewpay/rails": "0.0.0"
+    "@crewpay/rails": "0.0.0",
+    "@crewpay/signer": "0.0.0"
   }
 }
