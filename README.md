@@ -61,12 +61,12 @@ no network and no credentials, so it is reviewable before any rail is wired in.
 | `packages/domain` | done | — | Types: money, payees, operations, pay runs, policies, invoices, agent tasks |
 | `packages/policy` | **done** | 15 | The deterministic constraint engine (the moat) |
 | `packages/ledger` | **done** | 6 | Double-entry journal with balanced-entry enforcement |
-| `packages/rails` | **done** | 51 | `SettlementRail` + `FakeRail`, 1Click adapter, PingPay checkout/webhook, Agent Pay (x402 + MPP) |
+| `packages/rails` | **done** | 52 | `SettlementRail` + `FakeRail`, 1Click adapter, PingPay checkout/webhook, Agent Pay (x402 + MPP) |
 | `packages/signer` | **done** | 45 | OutLayer TEE custody, manifest compile + drift, four-way funding outcome |
 | `apps/agent` | **done** | 26 | Orchestrator: pay runs and per-task agent payouts |
 | `apps/api` | **done** | 39 | Control plane over `node:http`, in-memory store |
 
-**182 tests, `tsc` clean.**
+**183 tests, `tsc` clean.**
 
 ## The three money flows
 
@@ -152,12 +152,20 @@ No build step and no runtime dependencies are needed for the core packages.
 
 ```bash
 npm install        # links the workspace packages
-npm test           # 182 tests across policy, ledger, rails, signer, agent and api
+npm test           # 183 tests across policy, ledger, rails, signer, agent and api
 npm run demo       # end-to-end pay run against the FakeRail + FakeSigner
 npm run test:signer    # signer outcome, manifest and idempotency tests only
 npm run verify:tokens  # check the pinned asset table against live 1Click
+npm run smoke:live     # run the real rails against live services (needs network)
 npm run typecheck  # strict tsc, no emit
 ```
+
+`smoke:live` is the one command here that touches the network, so it is
+deliberately not part of `npm test`. It asserts that our parsers accept what the
+live services actually return, on the paths that need no credentials: the 1Click
+token list and a dry quote, Ping x402 discovery, and an OutLayer **testnet**
+wallet (`POST /register` mints a throwaway one). It catches shape drift in
+minutes and needs nothing from anyone.
 
 The demo seeds four payees and runs one pay run. Expected result: one contractor
 settles (with a deposit proof), one operation's funding is escalated to

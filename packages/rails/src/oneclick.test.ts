@@ -114,11 +114,18 @@ test("quote sends the exact shape the API requires", async () => {
   }
   assert.equal(body.swapType, "EXACT_OUTPUT");
   assert.equal(body.amount, "1500000000");
+  assert.equal(body.dry, false, "a real run must not be dry");
   assert.equal(body.originAsset, "nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near");
   assert.equal(
     body.destinationAsset,
     "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
   );
+});
+
+test("dry mode is opt-in and off by default, so a real run never mints a fake address", async () => {
+  const dry = mockFetch([{ body: QUOTE_RESPONSE }]);
+  await rail(dry.fn, { dry: true }).quote(op());
+  assert.equal((dry.calls[0]!.body as Record<string, unknown>).dry, true);
 });
 
 test("quote parses the response into typed bigints and keeps the signature", async () => {

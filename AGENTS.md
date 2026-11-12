@@ -250,11 +250,44 @@ Reference: x402 spec PR #3370. The facilitator is reached at
   turned into an Operation first (`operationForTask`), so per-kind caps and
   approval thresholds apply identically.
 
+## Live validation (what is actually reachable, verified 2026-11-12)
+
+`npm run smoke:live` runs the real rails against the real services and asserts
+our parsers accept the live payloads. It is **not** part of `npm test`: the unit
+suite must stay offline and deterministic. Run it by hand or on a schedule.
+
+- **1Click is mainnet-only and has no testnet**, by design. The token list
+  (`GET /v0/tokens`) and a **dry** quote (`POST /v0/quote` with `dry: true`) work
+  **with no API key**. A real (non-dry) quote returned `"Failed to get quote"`
+  unauthenticated — treat the executable path as needing a partner JWT from
+  `partners.near-intents.org`. Unauthenticated is a *fee* tier (25bps vs 20bps),
+  not a block, but only for the dry path. `OneClickRail` takes a `dry` flag so
+  the smoke test exercises the real client code without a key.
+- **Ping x402 discovery is unauthenticated and confirms our assumptions**:
+  `GET /agentpay/x402/supported` returns 33 kinds, `x402Version: 2`, `scheme:
+  exact`, `extra.assetTransferMethod: near-intents`, `paymentFlow: upfront`.
+  `/offers`, `/verify` and `/settle` return **401** without a Ping API key.
+  Ping staging exists ("staging+") but publishes no hostname; ask the Ping team.
+- **OutLayer testnet is the only real testnet any adapter has**:
+  `https://testnet-api.outlayer.ai` (the host *is* the network switch — there is
+  no parameter). `POST /register` with an empty body mints a throwaway wallet
+  and returns a `wk_` key, so the smoke test needs no external credential.
+  All nine paths in `OutLayerClient` were diffed against the published OpenAPI
+  spec and exist. NEAR Intents do **not** exist on testnet (no solvers) —
+  swaps/intents answer 503 there; wallets and policy work.
+- **x402 request shapes match the docs field-for-field.** `verify` body is
+  `{x402Version:2, paymentPayload:{payload:{type:"quote",refundTo}}, paymentRequirements:offer}`;
+  `settle` adds `operationToken`, `depositAddress`, `txHash` (and `depositMemo`
+  when the origin rail needs one). No drift found.
+- **Known gap, not yet closed:** `INCOMPLETE_DEPOSIT` retries the same token but
+  does **not** top the deposit up. That is the safe half only — a short deposit
+  cannot succeed unattended.
+
 ## Status
 
 Done and tested: `domain`, `policy`, `ledger`, `rails` (incl. 1Click adapter,
 PingPay checkout/webhook, Agent Pay x402 + MPP charge), `signer` (OutLayer TEE
 custody + FakeSigner), agent orchestration (pay run + agent task payouts), api
 skeleton, approvals inbox, policy manifest + drift, PingPay invoices, agent task
-payouts + 1099-style export. 182 tests.
+payouts + 1099-style export. 183 tests.
 Not started: Postgres persistence, web UI.

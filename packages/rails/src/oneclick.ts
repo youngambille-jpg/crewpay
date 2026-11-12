@@ -68,6 +68,12 @@ export interface OneClickConfig {
   /** Crewpay's take-rate, collected by 1Click on our behalf. */
   readonly appFee?: AppFee;
   readonly slippageBps?: number;
+  /**
+   * Ask 1Click to price the corridor without minting a deposit address. A dry
+   * quote is the only 1Click path that needs no partner key, so it is what the
+   * live smoke test exercises; a real run leaves this false.
+   */
+  readonly dry?: boolean;
   /** How far ahead the quote deadline sits, in milliseconds. */
   readonly deadlineMs?: number;
   readonly fetchImpl?: typeof fetch;
@@ -133,7 +139,7 @@ export class OneClickRail implements SettlementRail {
 
   async quote(op: Operation): Promise<Quote> {
     const body = {
-      dry: false,
+      dry: this.cfg.dry ?? false,
       depositType: this.cfg.depositType ?? "ORIGIN_CHAIN",
       swapType: "EXACT_OUTPUT",
       slippageTolerance: this.cfg.slippageBps ?? 100,
