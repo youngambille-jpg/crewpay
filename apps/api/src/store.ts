@@ -1,4 +1,4 @@
-import type { Approval, ChainAsset, Invoice, Operation, PayRun, PayRunItem, Payee, Policy } from "@crewpay/domain";
+import type { AgentTask, Approval, ChainAsset, Invoice, Operation, PayRun, PayRunItem, Payee, Policy } from "@crewpay/domain";
 
 export interface Store {
   payees: Map<string, Payee>;
@@ -16,6 +16,8 @@ export interface Store {
   invoicePayRuns: Map<string, { payeeId: string; origin?: ChainAsset }>;
   /** eventId -> seen marker, so a retried webhook is not acted on twice. */
   webhookEvents: Map<string, { type: string; at: string }>;
+  /** Agent tasks, by id. A task is the claim; its payout is the money movement. */
+  agentTasks: Map<string, AgentTask>;
 }
 
 export function createStore(): Store {
@@ -31,6 +33,7 @@ export function createStore(): Store {
     invoices: new Map(),
     invoicePayRuns: new Map(),
     webhookEvents: new Map(),
+    agentTasks: new Map(),
   };
 }
 

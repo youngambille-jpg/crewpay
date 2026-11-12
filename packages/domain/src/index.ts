@@ -5,3 +5,4 @@ export * from "./payrun.ts";
 export * from "./policy.ts";
 export * from "./approval.ts";
 export * from "./invoice.ts";
+export * from "./agent-task.ts";

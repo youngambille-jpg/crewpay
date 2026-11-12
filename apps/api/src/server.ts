@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type {
+  AgentTask,
   Approval,
   ChainAsset,
   Invoice,
@@ -14,10 +15,10 @@ import type {
   UsdCents,
 } from "@crewpay/domain";
 import { defaultRules, corridor, invoiceStatusFor } from "@crewpay/domain";
-import type { PingPayPort, SettlementRail } from "@crewpay/rails";
+import type { AgentPayPort, PingPayPort, SettlementRail } from "@crewpay/rails";
 import type { Signer } from "@crewpay/signer";
 import { compileManifest, diffManifest, type ManifestDrift } from "@crewpay/signer";
-import { executeApproved, executeRun } from "@crewpay/agent";
+import { executeApproved, executeRun, payAgentTask } from "@crewpay/agent";
 import { activePolicy, createStore, type Store } from "./store.ts";
 
 export interface ApiDeps {
@@ -26,6 +27,8 @@ export interface ApiDeps {
   readonly signer?: Signer;
   /** Ping checkout + webhook verification. Without it, invoices are off. */
   readonly pingpay?: PingPayPort;
+  /** Agent Pay facilitator (x402). Without it, agent task payouts are off. */
+  readonly agentpay?: AgentPayPort;
   readonly store?: Store;
 }
 
@@ -499,6 +502,132 @@ async function handle(
       approval: result.approval,
       ...(result.reasons ? { reasons: result.reasons } : {}),
     });
+  }
+
+  if (method === "POST" && url.pathname === "/v1/agent-tasks") {
+    if (!deps.agentpay) return send(res, 400, { error: "no agentpay client configured" });
+    const body = (await readJson(req)) as {
+      id?: string;
+      orgId: string;
+      payeeId: string;
+      resourceUrl: string;
+      /** Destination base units the agent must receive. */
+      amountOut: string | number;
+      usdCents: UsdCents;
+      description?: string;
+      externalId?: string;
+    };
+    const payee = store.payees.get(body.payeeId);
+    if (!payee) return send(res, 400, { error: `unknown payee ${body.payeeId}` });
+    const policy = activePolicy(store, body.orgId);
+    if (!policy) return send(res, 400, { error: "no active policy for org" });
+
+    const taskId = body.id ?? `task_${store.agentTasks.size + 1}`;
+    const task: AgentTask = {
+      id: taskId,
+      orgId: body.orgId,
+      payeeId: body.payeeId,
+      protocol: "x402",
+      resourceUrl: body.resourceUrl,
+      amountOut: BigInt(body.amountOut),
+      usdCents: body.usdCents,
+      destination: payee.destination,
+      ...(body.description ? { description: body.description } : {}),
+      ...(body.externalId ? { externalId: body.externalId } : {}),
+      status: "open",
+      createdAt: new Date().toISOString(),
+    };
+    store.agentTasks.set(task.id, task);
+
+    const outcome = await payAgentTask(task, policy, {
+      agentpay: deps.agentpay,
+      ...(deps.signer ? { signer: deps.signer } : {}),
+      lookupPayee: (id) => store.payees.get(id),
+      payeeHasHistory: (id) => (store.payeeHistory.get(id) ?? 0) > 0,
+      spentTodayCents: store.settledTodayCents.get(body.orgId) ?? 0,
+    });
+
+    // A denial is recorded as a failed task so nothing downstream mistakes it
+    // for something that could still pay; a held-back payout keeps its own
+    // status, because it is waiting on a human, not on a retry.
+    const status: AgentTask["status"] = outcome.status === "denied" ? "failed" : outcome.status;
+    const updated: AgentTask = {
+      ...task,
+      status,
+      ...(outcome.status === "paid" ? { receipt: outcome.receipt } : {}),
+      ...("reason" in outcome ? { note: outcome.reason } : {}),
+    };
+    store.agentTasks.set(task.id, updated);
+
+    if (outcome.status === "paid") {
+      store.payeeHistory.set(task.payeeId, (store.payeeHistory.get(task.payeeId) ?? 0) + 1);
+      store.settledTodayCents.set(
+        task.orgId,
+        (store.settledTodayCents.get(task.orgId) ?? 0) + task.usdCents,
+      );
+    }
+
+    const code = outcome.status === "paid" ? 201 : outcome.status === "awaiting_approval" ? 202 : 409;
+    return send(res, code, {
+      task: updated,
+      status: outcome.status,
+      ...(outcome.status === "paid" ? { journal: outcome.journal } : {}),
+      ...(outcome.status === "denied" || outcome.status === "awaiting_approval"
+        ? { reasons: outcome.decision.reasons.map((r) => r.code) }
+        : {}),
+      ...(outcome.status === "failed" || outcome.status === "needs_review" ? { reason: outcome.reason } : {}),
+    });
+  }
+
+  if (method === "GET" && url.pathname === "/v1/agent-tasks") {
+    const orgId = url.searchParams.get("orgId");
+    const all = [...store.agentTasks.values()].filter((t) => !orgId || t.orgId === orgId);
+    return send(res, 200, all);
+  }
+
+  if (method === "GET" && url.pathname === "/v1/exports/agent-payments") {
+    // A 1099-style roll-up: what each agent payee was paid in a tax year, with
+    // the terminal receipt for each payment so a figure can be traced to a
+    // transaction rather than taken on trust.
+    const orgId = url.searchParams.get("orgId");
+    if (!orgId) return send(res, 400, { error: "orgId is required" });
+    const year = url.searchParams.get("year") ?? String(new Date().getUTCFullYear());
+
+    const rows = new Map<
+      string,
+      { payeeId: string; displayName: string; totalBaseUnits: bigint; totalUsdCents: number; payments: number }
+    >();
+    for (const task of store.agentTasks.values()) {
+      if (task.orgId !== orgId || task.status !== "paid" || !task.receipt) continue;
+      if (!task.receipt.settledAt.startsWith(year)) continue;
+      const payee = store.payees.get(task.payeeId);
+      const row = rows.get(task.payeeId) ?? {
+        payeeId: task.payeeId,
+        displayName: payee?.displayName ?? task.payeeId,
+        totalBaseUnits: 0n,
+        totalUsdCents: 0,
+        payments: 0,
+      };
+      row.totalBaseUnits += task.receipt.amountIn;
+      row.totalUsdCents += task.usdCents;
+      row.payments += 1;
+      rows.set(task.payeeId, row);
+    }
+
+    const report = [...rows.values()]
+      .sort((a, b) => b.totalUsdCents - a.totalUsdCents)
+      .map((r) => ({
+        payeeId: r.payeeId,
+        displayName: r.displayName,
+        totalBaseUnits: r.totalBaseUnits.toString(),
+        totalUsdCents: r.totalUsdCents,
+        totalUsd: (r.totalUsdCents / 100).toFixed(2),
+        payments: r.payments,
+        // 1099-NEC reporting threshold for a non-employee, in cents.
+        meetsReportingThreshold: r.totalUsdCents >= 60_000,
+      }));
+
+    return send(res, 200, { orgId, year, currency: "usd", rows: report });
   }
 
   return send(res, 404, { error: "not found" });

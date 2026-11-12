@@ -218,10 +218,43 @@ the same URL plus `.md`, and `llms.txt` indexes them all. API base:
   payment id, and `data` is free-form ("anything").
 - Webhook endpoints are created in the dashboard, not via the agent API.
 
+## Agent Pay / x402 notes (read from the docs, not guessed)
+
+Reference: x402 spec PR #3370. The facilitator is reached at
+`{base}/agentpay/x402/{supported,offers,verify,settle}`; MPP charge is at
+`{base}/agentpay/mpp/charge`.
+
+- **Direction is the trap.** Ping's facilitator is *payee-side*: it settles to
+  the recipient configured on the **API-key org**. Our use is paying agents
+  *out*, so we drive the **payer** half of the flow — the #3370 sequence has the
+  payer call `/verify` then `/settle` directly. Getting this backwards is the
+  single easiest way to build the wrong thing here.
+- **Three-step flow:** `offers` (no key) → `verify` with a `quote` payload →
+  `settle` with a `deposit` payload. The quote returns the `depositAddress` and
+  the `operationToken` in `extra`; we fund the address, then settle with the
+  deposit's `txHash`.
+- **Scheme is `exact`, `assetTransferMethod: near-intents`, `paymentFlow:
+  upfront`.** An unquoted `accepts[]` entry has empty `payTo` and `amount` — the
+  amount is only pinned at quote time.
+- **`refundTo` is required on the quote payload and has no dashboard fallback.**
+  We fail closed locally rather than let Ping fail after a deposit may be in
+  flight.
+- **One `operationToken` across retries.** `settlement_pending` and
+  `INCOMPLETE_DEPOSIT` both mean the deposit exists — retry the *same* token.
+  Re-quoting mints a new address and abandons the in-flight deposit.
+- **`INCOMPLETE_DEPOSIT` arrives as HTTP 200 with `success: false`.** Reading
+  only `success` calls a top-up-able deposit dead. 503/504 are retryable; 402 is
+  terminal.
+- **A success with no `transaction` hash is not evidence.** Treat as unknown.
+- **Agent payments go through the same policy engine as payroll.** A task is
+  turned into an Operation first (`operationForTask`), so per-kind caps and
+  approval thresholds apply identically.
+
 ## Status
 
-Done and tested: `domain`, `policy`, `ledger`, `rails` (incl. 1Click adapter and
-PingPay checkout/webhook), `signer` (OutLayer TEE custody + FakeSigner), agent
-orchestration, api skeleton, approvals inbox, policy manifest + drift, PingPay
-invoices. 138 tests.
-Not started: x402/MPP agent payouts, Postgres persistence, web UI.
+Done and tested: `domain`, `policy`, `ledger`, `rails` (incl. 1Click adapter,
+PingPay checkout/webhook, Agent Pay x402 + MPP charge), `signer` (OutLayer TEE
+custody + FakeSigner), agent orchestration (pay run + agent task payouts), api
+skeleton, approvals inbox, policy manifest + drift, PingPay invoices, agent task
+payouts + 1099-style export. 182 tests.
+Not started: Postgres persistence, web UI.

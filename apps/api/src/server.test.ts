@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
-import { FakeRail, FakePingPay } from "@crewpay/rails";
+import { FakeRail, FakePingPay, FakeAgentPay } from "@crewpay/rails";
 import { FakeSigner } from "@crewpay/signer";
 import { defaultRules } from "@crewpay/domain";
 import { createApi } from "./server.ts";
@@ -11,13 +11,18 @@ function base(chain: string, asset: string) {
 }
 
 async function start(
-  opts: ConstructorParameters<typeof FakeRail>[0] & { signer?: FakeSigner; pingpay?: FakePingPay } = {},
+  opts: ConstructorParameters<typeof FakeRail>[0] & {
+    signer?: FakeSigner;
+    pingpay?: FakePingPay;
+    agentpay?: FakeAgentPay;
+  } = {},
 ) {
-  const { signer, pingpay, ...railOpts } = opts;
+  const { signer, pingpay, agentpay, ...railOpts } = opts;
   const { server, store } = createApi({
     rail: new FakeRail(railOpts),
     ...(signer ? { signer } : {}),
     ...(pingpay ? { pingpay } : {}),
+    ...(agentpay ? { agentpay } : {}),
   });
   await new Promise<void>((resolve) => server.listen(0, resolve));
   const port = (server.address() as AddressInfo).port;
@@ -666,6 +671,197 @@ test("invoices are off when no pingpay client is configured", async () => {
   try {
     const res = await started.call("/v1/invoices", "POST", { orgId: "org_1", customerId: "acme", amount: 100 });
     assert.equal(res.status, 400);
+  } finally {
+    started.server.close();
+  }
+});
+
+// --- Agent task payouts: x402 quote -> deposit -> settle --------------------
+
+function agentApi(opts: ConstructorParameters<typeof FakeAgentPay>[0] = {}) {
+  return new FakeAgentPay(opts);
+}
+
+/** Seed an approved agent payee and a policy that lets small payouts through. */
+async function seedAgent(started: Awaited<ReturnType<typeof start>>) {
+  await started.call("/v1/payees", "POST", {
+    id: "gpt-worker",
+    orgId: "org_1",
+    kind: "agent",
+    displayName: "GPT Worker",
+    destination: base("near", "usdc"),
+    address: "agent.near",
+    status: "approved",
+    screening: "clear",
+  });
+  await started.call("/v1/policies", "POST", {
+    orgId: "org_1",
+    rules: { ...defaultRules(), requireApprovalForNewPayee: false },
+  });
+}
+
+const agentTask = (overrides: Record<string, unknown> = {}) => ({
+  orgId: "org_1",
+  payeeId: "gpt-worker",
+  resourceUrl: "https://api.example.com/agent/infer",
+  amountOut: "200000",
+  usdCents: 20_000,
+  ...overrides,
+});
+
+test("paying an agent task settles and returns a receipt", async () => {
+  const started = await start({ agentpay: agentApi(), signer: new FakeSigner() });
+  try {
+    await seedAgent(started);
+    const res = await started.call("/v1/agent-tasks", "POST", agentTask());
+    assert.equal(res.status, 201);
+    assert.equal(res.json["status"], "paid");
+    const task = res.json["task"] as Record<string, unknown>;
+    assert.equal(task["status"], "paid");
+    const receipt = task["receipt"] as Record<string, unknown>;
+    assert.equal(receipt["network"], "near:mainnet");
+    assert.ok(receipt["operationToken"]);
+    assert.ok(res.json["journal"]);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("an agent task over the per-kind cap is denied and nothing is settled", async () => {
+  const agentpay = agentApi();
+  const started = await start({ agentpay, signer: new FakeSigner() });
+  try {
+    await seedAgent(started);
+    await started.call("/v1/policies", "POST", {
+      orgId: "org_1",
+      rules: { ...defaultRules(), requireApprovalForNewPayee: false, perKindCents: { agent: 10_000 } },
+    });
+    const res = await started.call("/v1/agent-tasks", "POST", agentTask({ usdCents: 50_000 }));
+    assert.equal(res.status, 409);
+    assert.equal(res.json["status"], "denied");
+    assert.deepEqual(res.json["reasons"], ["PER_KIND_CAP"]);
+    assert.equal(agentpay.settleCalls.length, 0);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("an agent task over the approval threshold is held back", async () => {
+  const agentpay = agentApi();
+  const started = await start({ agentpay, signer: new FakeSigner() });
+  try {
+    await seedAgent(started);
+    await started.call("/v1/policies", "POST", {
+      orgId: "org_1",
+      rules: { ...defaultRules(), requireApprovalForNewPayee: false, approvalThresholdCents: 10_000 },
+    });
+    const res = await started.call("/v1/agent-tasks", "POST", agentTask({ usdCents: 20_000 }));
+    assert.equal(res.status, 202);
+    assert.equal(res.json["status"], "awaiting_approval");
+    assert.equal((res.json["task"] as Record<string, unknown>)["status"], "awaiting_approval");
+    assert.equal(agentpay.settleCalls.length, 0);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("a pending settlement is retried with the same token and still pays once", async () => {
+  const agentpay = agentApi({ pendingSettles: 1 });
+  const started = await start({ agentpay, signer: new FakeSigner() });
+  try {
+    await seedAgent(started);
+    const res = await started.call("/v1/agent-tasks", "POST", agentTask());
+    assert.equal(res.status, 201);
+    assert.equal(res.json["status"], "paid");
+    assert.equal(agentpay.settleCalls.length, 2);
+    assert.equal(new Set(agentpay.settleCalls.map((c) => c.operationToken)).size, 1);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("an unknown payee is rejected before any facilitator call", async () => {
+  const agentpay = agentApi();
+  const started = await start({ agentpay, signer: new FakeSigner() });
+  try {
+    await seedAgent(started);
+    const res = await started.call("/v1/agent-tasks", "POST", agentTask({ payeeId: "nobody" }));
+    assert.equal(res.status, 400);
+    assert.equal(agentpay.settleCalls.length, 0);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("agent task payouts are off without a facilitator client", async () => {
+  const started = await start();
+  try {
+    const res = await started.call("/v1/agent-tasks", "POST", agentTask());
+    assert.equal(res.status, 400);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("the 1099-style export rolls up paid agent tasks by payee", async () => {
+  const started = await start({ agentpay: agentApi(), signer: new FakeSigner() });
+  try {
+    await seedAgent(started);
+    await started.call("/v1/agent-tasks", "POST", agentTask({ id: "t1", usdCents: 40_000 }));
+    await started.call("/v1/agent-tasks", "POST", agentTask({ id: "t2", usdCents: 25_000 }));
+
+    const year = new Date().getUTCFullYear();
+    const res = await started.call(`/v1/exports/agent-payments?orgId=org_1&year=${year}`, "GET");
+    assert.equal(res.status, 200);
+    const rows = res.json["rows"] as Record<string, unknown>[];
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]!["payeeId"], "gpt-worker");
+    assert.equal(rows[0]!["displayName"], "GPT Worker");
+    assert.equal(rows[0]!["totalUsdCents"], 65_000);
+    assert.equal(rows[0]!["totalUsd"], "650.00");
+    assert.equal(rows[0]!["payments"], 2);
+    // 650.00 is past the 600.00 1099-NEC threshold.
+    assert.equal(rows[0]!["meetsReportingThreshold"], true);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("the export excludes a year with no payments and reports an empty roll-up", async () => {
+  const started = await start({ agentpay: agentApi(), signer: new FakeSigner() });
+  try {
+    await seedAgent(started);
+    await started.call("/v1/agent-tasks", "POST", agentTask({ id: "t1", usdCents: 1_000 }));
+    const res = await started.call("/v1/exports/agent-payments?orgId=org_1&year=1999", "GET");
+    assert.equal((res.json["rows"] as unknown[]).length, 0);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("the export requires an org", async () => {
+  const started = await start();
+  try {
+    const res = await started.call("/v1/exports/agent-payments", "GET");
+    assert.equal(res.status, 400);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("an unpaid task is listed but not counted in the export", async () => {
+  const started = await start({ agentpay: agentApi({ pendingSettles: 99 }), signer: new FakeSigner() });
+  try {
+    await seedAgent(started);
+    await started.call("/v1/agent-tasks", "POST", agentTask({ id: "t1", usdCents: 30_000 }));
+    const list = await started.call("/v1/agent-tasks?orgId=org_1", "GET");
+    const tasks = list.json as unknown as Record<string, unknown>[];
+    assert.equal(tasks.length, 1);
+    assert.equal(tasks[0]!["status"], "needs_review");
+
+    const year = new Date().getUTCFullYear();
+    const exp = await started.call(`/v1/exports/agent-payments?orgId=org_1&year=${year}`, "GET");
+    assert.equal((exp.json["rows"] as unknown[]).length, 0);
   } finally {
     started.server.close();
   }

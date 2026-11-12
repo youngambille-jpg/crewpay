@@ -4,3 +4,6 @@ export * from "./fake.ts";
 export * from "./oneclick.ts";
 export * from "./pingpay.ts";
 export * from "./pingpay-fake.ts";
+export * from "./agentpay.ts";
+export * from "./agentpay-fake.ts";
+export * from "./mpp.ts";

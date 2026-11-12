@@ -78,6 +78,9 @@ GET    /v1/custody/approvals           mirror the wallet's own multisig inbox
 POST   /v1/invoices                    issue an invoice (PingPay checkout)
 GET    /v1/invoices                    invoices (?orgId=)
 POST   /v1/webhooks/pingpay            payment settled -> trigger pay run / reconcile
+POST   /v1/agent-tasks                 pay an agent per task (x402 quote/deposit/settle)
+GET    /v1/agent-tasks                 agent tasks (?orgId=)
+GET    /v1/exports/agent-payments      1099-style roll-up by payee (?orgId=&year=)
 POST   /v1/webhooks/1click             swap status transitions
 GET    /v1/ledger                      journal export (CSV/JSON) + attestations
 ```
@@ -334,6 +337,42 @@ posted run uses, so the policy is enforced identically whether a human or a
 webhook started it, and a large invoice is still held for approval. Only
 `COMPLETED` pays: `EXPIRED` and `CANCELLED` are terminal non-payments.
 
+### 3.5d Agent task payouts: paying an agent over x402
+
+An agent payee is not a special case of money. A task is turned into an ordinary
+Operation and handed to the same policy engine a payroll line goes through, so
+an agent over its `perKindCents` cap is denied exactly as a contractor over a
+cap is. The reason is not symmetry for its own sake: an agent is the payee most
+likely to be paid many small amounts unattended, which is precisely the case
+where a cap matters, and a second soft path to money is where caps go to die.
+
+Settlement then runs the x402 #3370 payer flow: `offers` to learn which origin
+assets the facilitator will accept, `verify` with a `quote` payload to pin one
+and get a deposit address plus an `operationToken`, a deposit to that address,
+then `settle` with a `deposit` payload. Two details carry the correctness:
+
+**One token across every retry.** `pending` and `INCOMPLETE_DEPOSIT` both mean
+the deposit exists — one is still settling, the other was short and can be
+topped up. Both are retried with the *same* `operationToken`. Re-quoting instead
+would mint a fresh deposit address and abandon funds already on their way, which
+is the same double-pay failure as a non-idempotent webhook, arrived at from the
+other direction.
+
+**Failure is four states, not two.** `settlement_pending` and
+`INCOMPLETE_DEPOSIT` are distinct from a terminal failure, and 503/504 are
+retryable where 402 is not. Collapsing them into "failed" either abandons a
+live deposit or hammers a terminal error; the code keeps them apart and gives
+each its own handling. A success with no transaction hash is treated as
+unknown, not settled, because a receipt without a hash is not evidence.
+
+**`refundTo` fails closed.** It is required on the quote payload and there is no
+dashboard fallback (#3370), so the client refuses locally rather than letting
+Ping fail after a deposit address may already be in flight.
+
+`/v1/exports/agent-payments` rolls the paid tasks up per payee per tax year with
+a 1099-NEC reporting flag, so the figure traces to a receipt rather than to a
+number someone typed.
+
 ### 3.6 `store` — Postgres for orgs, payees, pay runs, operations, decisions,
 journal, receipts, and webhook events. Redis for the job queue and idempotency
 locks.
@@ -528,7 +567,9 @@ agent worker (Node)  ─┘        │
 9. **PingPay invoices** — hosted checkout, HMAC-verified webhook, read-back
    before release, and a paid invoice opens a pay run through the same policy
    path (`/v1/invoices`, `/v1/webhooks/pingpay`).
-10. **Agent payees** — x402/MPP per-task settlement + 1099-style export.
+10. **Agent payees** — done: a task becomes an Operation, passes the same policy
+    gate, and settles over x402 (quote → deposit → settle) with one token across
+    retries; `/v1/agent-tasks`, `/v1/exports/agent-payments`.
 11. **Treasury** — Earn, limit orders, sweeps.
 12. **Accounting exports** — QuickBooks/Xero sync, attestation bundle.
 

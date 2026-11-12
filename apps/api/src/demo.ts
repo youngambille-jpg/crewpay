@@ -4,7 +4,7 @@
  * credentials. Run with `npm run demo`.
  */
 import type { AddressInfo } from "node:net";
-import { FakeRail, FakePingPay } from "@crewpay/rails";
+import { FakeRail, FakePingPay, FakeAgentPay } from "@crewpay/rails";
 import { FakeSigner } from "@crewpay/signer";
 import { defaultRules } from "@crewpay/domain";
 import { createApi } from "./server.ts";
@@ -14,6 +14,7 @@ const { server } = createApi({
   rail: new FakeRail({ slowOperationIds: ["run_1_op_3"] }),
   signer: new FakeSigner({ needsReviewOperationIds: ["run_1_op_2"] }),
   pingpay,
+  agentpay: new FakeAgentPay({ pendingSettles: 1 }),
 });
 
 await new Promise<void>((resolve) => server.listen(0, resolve));
@@ -117,5 +118,23 @@ const settled = await (
   })
 ).json();
 console.log("invoice settled by webhook:", JSON.stringify(settled, null, 2));
+
+// Agent task payout: an agent served a 402-protected resource and is owed for
+// it. The payout goes through the same policy engine as a payroll line, then
+// settles over x402 (quote -> deposit -> settle) with the same token on retry.
+const agentTask = await post("/v1/agent-tasks", {
+  orgId: "org_1",
+  payeeId: "gpt-worker",
+  resourceUrl: "https://api.example.com/agent/infer",
+  amountOut: "200000",
+  usdCents: 20_000,
+  description: "batch inference job",
+});
+console.log("agent task paid:", JSON.stringify(agentTask, null, 2));
+
+const exports = await (
+  await fetch(`${base}/v1/exports/agent-payments?orgId=org_1`)
+).json();
+console.log("1099-style export:", JSON.stringify(exports, null, 2));
 
 server.close();
