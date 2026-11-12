@@ -109,8 +109,8 @@ test("createCheckout sends the publishable key and never the secret", async () =
   assert.equal(session.sessionId, "cs_1");
   assert.equal(session.sessionUrl, "https://checkout.pingpay.io/session/cs_1");
   assert.equal(seen!.url, "https://pay.pingpay.io/api/checkout/sessions");
-  assert.equal(seen!.headers["x-publishable-key"], "pk_test_123");
-  assert.equal(seen!.headers["x-api-key"], undefined);
+  assert.equal(seen!.headers["x-api-key"], "pk_test_123");
+  assert.equal(seen!.headers["x-publishable-key"], undefined);
   // 250000 cents = 2500.00 USDC -> 2500 * 10^6 base units.
   assert.equal(seen!.body["amount"], "2500000000");
   assert.deepEqual(seen!.body["asset"], { chain: "NEAR", symbol: "USDC" });

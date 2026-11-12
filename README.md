@@ -164,7 +164,8 @@ npm run typecheck  # strict tsc, no emit
 deliberately not part of `npm test`. It asserts that our parsers accept what the
 live services actually return, on the paths that need no credentials: the 1Click
 token list and a dry quote, Ping x402 discovery, and an OutLayer **testnet**
-wallet (`POST /register` mints a throwaway one). It catches shape drift in
+wallet (`POST /register` mints a throwaway one). Set `PING_API_KEY` to also
+exercise the PingPay checkout and facilitator paths. It catches shape drift in
 minutes and needs nothing from anyone.
 
 The demo seeds four payees and runs one pay run. Expected result: one contractor

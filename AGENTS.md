@@ -275,6 +275,19 @@ suite must stay offline and deterministic. Run it by hand or on a schedule.
   All nine paths in `OutLayerClient` were diffed against the published OpenAPI
   spec and exist. NEAR Intents do **not** exist on testnet (no solvers) —
   swaps/intents answer 503 there; wallets and policy work.
+- **PingPay's header name is `x-api-key`, not `x-publishable-key`.** Verified
+  live: the checkout route returns **401** for `x-publishable-key` and accepts
+  `x-api-key` (which carries the `pk_` value). Our client sent the wrong one and
+  every fixture test passed anyway, because the mock accepted any header. Fixed;
+  this is the single best argument for the smoke test existing.
+- **A valid PingPay key still cannot complete a run until the org is
+  configured.** `GET /api/agentpay/registration` reports
+  `{enabled:false, valid:false, recipientConfigured:false}`, and both the
+  checkout and the facilitator answer `agent_pay_misconfigured` / "no recipient
+  address configured". Auth passes; the org has no receive asset or recipient
+  set. That is dashboard work (Settings → choose the asset you receive), not
+  code. `GET /api/checkout/sessions/{id}` with no key returns 404, not 401 —
+  the session id space is not an auth oracle.
 - **x402 request shapes match the docs field-for-field.** `verify` body is
   `{x402Version:2, paymentPayload:{payload:{type:"quote",refundTo}}, paymentRequirements:offer}`;
   `settle` adds `operationToken`, `depositAddress`, `txHash` (and `depositMemo`

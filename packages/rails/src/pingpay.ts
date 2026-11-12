@@ -3,16 +3,19 @@ import type { ChainAsset, PingCheckoutStatus, UsdCents } from "@crewpay/domain";
 import { RailError } from "./settlement.ts";
 
 /**
- * Ping's API uses two different keys for two different jobs, and swapping them
- * is the mistake this client exists to prevent:
+ * Ping's API uses two different keys for two different jobs, and the header
+ * names are easy to get wrong:
  *
- * - `x-publishable-key` (`pk_`) on the checkout and payment routes. These run
- *   in the customer's browser, so the key is public by design.
- * - `x-api-key` on the Agent Pay facilitator, which the agent calls server-side.
+ * - `x-api-key` on the checkout and payment routes, carrying the publishable
+ *   (`pk_`) key. Those routes run in the customer's browser, so the key is
+ *   public by design.
+ * - `x-api-key` on the Agent Pay facilitator too, but there it carries a key
+ *   tied to the org whose payee metadata is configured; the agent calls it
+ *   server-side.
  *
- * A publishable key in the agent's config is not a leak. A *secret* key sent to
- * a browser would be, which is why there is no way to reach the facilitator
- * with one here.
+ * Verified against the live API: the checkout route rejects
+ * `x-publishable-key` with 401 and accepts `x-api-key`. A publishable key in
+ * the agent's config is not a leak; a *secret* key sent to a browser would be.
  */
 export interface PingPayConfig {
   /** `pk_` key for checkout and payment reads. Safe to expose to a browser. */
@@ -209,8 +212,8 @@ export class PingPayClient implements PingPayPort {
     body?: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
     const headers: Record<string, string> = {
-      // Checkout and payment routes take the publishable key, not the secret.
-      "x-publishable-key": this.publishableKey,
+      // Checkout and payment routes take the publishable key under `x-api-key`.
+      "x-api-key": this.publishableKey,
       accept: "application/json",
     };
     if (body) headers["content-type"] = "application/json";

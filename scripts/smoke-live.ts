@@ -18,13 +18,18 @@
  */
 import type { Operation } from "@crewpay/domain";
 import { corridor } from "@crewpay/domain";
-import { AssetRegistry, OneClickRail, AgentPayClient, KNOWN_TOKENS } from "@crewpay/rails";
+import { AssetRegistry, OneClickRail, AgentPayClient, KNOWN_TOKENS, PingPayClient } from "@crewpay/rails";
 import type { Quote } from "@crewpay/rails";
 import { OutLayerSigner } from "@crewpay/signer";
 
 const ONECLICK_URL = process.env["ONECLICK_BASE_URL"] ?? "https://1click.chaindefuser.com";
 const PING_URL = process.env["PING_BASE_URL"] ?? "https://pay.pingpay.io";
 const OUTLAYER_TESTNET = process.env["OUTLAYER_TESTNET_URL"] ?? "https://testnet-api.outlayer.ai";
+/**
+ * Optional PingPay key. When present, the authed paths are exercised too. It is
+ * read from the environment only — never committed, never logged.
+ */
+const PING_API_KEY = process.env["PING_API_KEY"];
 const TIMEOUT_MS = 30_000;
 
 const BASE_USDC = { chain: "base", asset: "usdc" } as const;
@@ -32,6 +37,7 @@ const NEAR_USDC = { chain: "near", asset: "usdc" } as const;
 
 let failures = 0;
 let checks = 0;
+let warnings = 0;
 
 function pass(name: string, detail: string): void {
   checks += 1;
@@ -42,6 +48,12 @@ function fail(name: string, detail: string): void {
   checks += 1;
   failures += 1;
   console.error(`  FAIL ${name} — ${detail}`);
+}
+
+/** Neither pass nor fail: an external state we cannot fix from code. */
+function warn(name: string, detail: string): void {
+  warnings += 1;
+  console.warn(`  warn ${name} — ${detail}`);
 }
 
 /** A fetch that refuses to hang: a dead service must fail the run, not stall it. */
@@ -268,14 +280,78 @@ async function checkOutLayerTestnet(): Promise<void> {
   }
 }
 
+/**
+ * PingPay authed paths. Only runs when a key is present in the environment.
+ *
+ * The point is to reach an *application* error rather than an auth error: a 401
+ * here means our header name or key handling is wrong, while a 400 about org
+ * configuration means our request was well-formed and Ping understood it. The
+ * distinction is the whole value of this check — fixture tests cannot see it.
+ *
+ * Nothing is created: the checkout call fails before a session exists, and if
+ * org config were complete we would still only be minting an unpaid session.
+ */
+async function checkPingPayAuthed(): Promise<void> {
+  console.log(`\nPingPay authed paths (${PING_URL})`);
+  if (!PING_API_KEY) {
+    warn("PING_API_KEY", "not set; skipping authed checks (set it to exercise checkout + facilitator)");
+    return;
+  }
+  const f = timeoutFetch();
+  const client = new PingPayClient({ publishableKey: PING_API_KEY, baseUrl: `${PING_URL}/api`, fetchImpl: f });
+
+  // 1. The checkout route is the one that carried a wrong header name. A 401
+  //    here is a real regression; a 400 about the recipient is external state.
+  try {
+    const session = await client.createCheckout({
+      amount: 100_000,
+      asset: NEAR_USDC,
+      successUrl: "https://example.com/success",
+      cancelUrl: "https://example.com/cancel",
+      customerReference: "crewpay_smoke",
+    });
+    pass("POST /checkout/sessions", `session minted: ${session.sessionId} (${session.status})`);
+  } catch (e) {
+    const msg = (e as Error).message;
+    const status = (e as { statusCode?: number }).statusCode ?? 0;
+    if (status === 401) {
+      fail("POST /checkout/sessions", `401 — our key handling is wrong: ${msg}`);
+    } else if (/recipient/i.test(msg)) {
+      warn("POST /checkout/sessions", `shape accepted, but org has no recipient configured: ${msg}`);
+    } else {
+      fail("POST /checkout/sessions", `unexpected: ${msg}`);
+    }
+  }
+
+  // 2. The facilitator's offers route is auth-gated and needs payee metadata on
+  //    the org. `agent_pay_misconfigured` proves auth passed and the request
+  //    shape was understood.
+  const agent = new AgentPayClient({ baseUrl: PING_URL, apiKey: PING_API_KEY, refundTo: "crewpay.near", fetchImpl: f });
+  try {
+    const offers = await agent.offers({ amountOut: 200_000n, description: "crewpay-smoke" });
+    pass("POST /agentpay/x402/offers", `${offers.accepts.length} origin assets offered (org configured)`);
+  } catch (e) {
+    const code = (e as { code?: string }).code;
+    const status = (e as { statusCode?: number }).statusCode ?? 0;
+    if (status === 401) {
+      fail("POST /agentpay/x402/offers", `401 — key rejected: ${(e as Error).message}`);
+    } else if (code === "agent_pay_misconfigured") {
+      warn("POST /agentpay/x402/offers", "auth OK, org not configured (Settings → choose receive asset + recipient)");
+    } else {
+      fail("POST /agentpay/x402/offers", `unexpected: ${(e as Error).message}`);
+    }
+  }
+}
+
 console.log(
   `CrewPay live smoke test\n  1Click:  ${ONECLICK_URL}\n  Ping:    ${PING_URL}\n  OutLayer: ${OUTLAYER_TESTNET}`,
 );
 await check1Click();
 await checkPingX402();
 await checkOutLayerTestnet();
+await checkPingPayAuthed();
 
-console.log(`\n${checks - failures}/${checks} checks passed`);
+console.log(`\n${checks - failures}/${checks} checks passed${warnings ? `, ${warnings} warning(s)` : ""}`);
 if (failures > 0) {
   console.error(`${failures} check(s) failed`);
   process.exit(1);
