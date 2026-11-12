@@ -327,6 +327,18 @@ suite must stay offline and deterministic. Run it by hand or on a schedule.
   post-deposit balance, and inventing an amount would mean sending real funds
   blind. A real top-up needs a wallet balance read that does not exist yet.
 
+- **The ledger was written but never persisted.** Journal entries were produced
+  by the pay-run and agent paths and returned to the caller, then dropped — the
+  store had no journal map, so `GET /v1/ledger` had nothing to read. Now
+  `store.journalEntries` records every entry at the three points money moves
+  (pay run, approval execute, agent task), and the export reports them with a
+  trial balance and a content-hash attestation.
+- **The export fails closed on unbalanced books.** `post()` already rejects a
+  single unbalanced entry, but a *set* of fine entries can still be wrong if one
+  is missing or duplicated, so the endpoint checks the whole set and returns 500
+  rather than report figures it cannot vouch for. The trial balance nets per
+  currency, which is the check that catches a torn or truncated ledger.
+
 ## Status
 
 Done and tested: `domain`, `policy`, `ledger`, `rails` (incl. 1Click adapter,

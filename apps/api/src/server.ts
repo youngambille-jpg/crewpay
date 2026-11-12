@@ -19,6 +19,7 @@ import type { AgentPayPort, PingPayPort, SettlementRail } from "@crewpay/rails";
 import type { Signer } from "@crewpay/signer";
 import { compileManifest, diffManifest, type ManifestDrift } from "@crewpay/signer";
 import { executeApproved, executeRun, payAgentTask } from "@crewpay/agent";
+import { allBalanced, attestation, trialBalance } from "@crewpay/ledger";
 import { activePolicy, createStore, type Store } from "./store.ts";
 
 export interface ApiDeps {
@@ -142,6 +143,9 @@ async function createPayRun(
     if (outcome.settlement?.status === "settled") {
       store.payeeHistory.set(outcome.payeeId, (store.payeeHistory.get(outcome.payeeId) ?? 0) + 1);
     }
+    // Persist the books for every settled line. A settlement the journal does
+    // not record is money the export cannot show.
+    if (outcome.journal) store.journalEntries.push(outcome.journal);
   }
   store.settledTodayCents.set(
     body.orgId,
@@ -494,6 +498,7 @@ async function handle(
         approval.orgId,
         (store.settledTodayCents.get(approval.orgId) ?? 0) + approval.operation.usdCents,
       );
+      if (result.journal) store.journalEntries.push(result.journal);
     }
 
     const status = result.status === "executed" ? 200 : 409;
@@ -565,6 +570,7 @@ async function handle(
         task.orgId,
         (store.settledTodayCents.get(task.orgId) ?? 0) + task.usdCents,
       );
+      store.journalEntries.push(outcome.journal);
     }
 
     const code = outcome.status === "paid" ? 201 : outcome.status === "awaiting_approval" ? 202 : 409;
@@ -628,6 +634,35 @@ async function handle(
       }));
 
     return send(res, 200, { orgId, year, currency: "usd", rows: report });
+  }
+
+  if (method === "GET" && url.pathname === "/v1/ledger") {
+    // The books, plus the two things that make them checkable: a trial balance
+    // that must net to zero per currency, and a content hash that pins the
+    // export to an exact set of entries.
+    const orgId = url.searchParams.get("orgId");
+    if (!orgId) return send(res, 400, { error: "orgId is required" });
+    const entries = store.journalEntries.filter((e) => e.orgId === orgId);
+
+    // An entry that does not balance is a bug, not a report. Refuse rather than
+    // hand back books we cannot vouch for.
+    if (!allBalanced(entries)) {
+      return send(res, 500, { error: "ledger contains an unbalanced entry; export refused" });
+    }
+
+    const balance = trialBalance(entries);
+    return send(res, 200, {
+      orgId,
+      entries: entries.map((e) => ({
+        ...e,
+        postings: e.postings.map((p) => ({ ...p, amount: p.amount.toString() })),
+      })),
+      trialBalance: balance.rows,
+      balanced: balance.balanced,
+      ...(balance.balanced ? {} : { unbalancedCurrencies: balance.unbalancedCurrencies }),
+      attestation: attestation(entries),
+      entryCount: entries.length,
+    });
   }
 
   return send(res, 404, { error: "not found" });

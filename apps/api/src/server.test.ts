@@ -866,3 +866,87 @@ test("an unpaid task is listed but not counted in the export", async () => {
     started.server.close();
   }
 });
+
+// --- Ledger export: the books, and the evidence they reconcile --------------
+
+test("the ledger export reflects a settled pay run and balances", async () => {
+  const started = await start({ signer: new FakeSigner() });
+  try {
+    // Below approvalThresholdCents (200_000) so the run settles rather than
+    // waiting on a human: an unsettled line writes no journal entry.
+    await seedAndRun(started.call, { usdCents: 150_000 });
+    const res = await started.call("/v1/ledger?orgId=org_1", "GET");
+    assert.equal(res.status, 200);
+    assert.equal(res.json["balanced"], true);
+    assert.equal(res.json["entryCount"], 1);
+
+    const entries = res.json["entries"] as Record<string, unknown>[];
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0]!["kind"], "payment_settled");
+    // Amounts leave as strings so a bigint never truncates through JSON.
+    const postings = entries[0]!["postings"] as Record<string, unknown>[];
+    assert.ok(postings.every((p) => typeof p["amount"] === "string"));
+
+    const tb = res.json["trialBalance"] as Record<string, unknown>[];
+    assert.ok(tb.length > 0);
+    assert.ok(typeof res.json["attestation"] === "string");
+  } finally {
+    started.server.close();
+  }
+});
+
+test("the ledger export is scoped to one org", async () => {
+  const started = await start({ signer: new FakeSigner() });
+  try {
+    await seedAndRun(started.call, { usdCents: 150_000 });
+    const other = await started.call("/v1/ledger?orgId=org_other", "GET");
+    assert.equal(other.status, 200);
+    assert.equal(other.json["entryCount"], 0);
+    assert.deepEqual(other.json["trialBalance"], []);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("the ledger export requires an org", async () => {
+  const started = await start();
+  try {
+    const res = await started.call("/v1/ledger", "GET");
+    assert.equal(res.status, 400);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("an agent task payout is recorded in the ledger", async () => {
+  const started = await start({ agentpay: agentApi(), signer: new FakeSigner() });
+  try {
+    await seedAgent(started);
+    await started.call("/v1/agent-tasks", "POST", agentTask());
+    const res = await started.call("/v1/ledger?orgId=org_1", "GET");
+    assert.equal(res.json["entryCount"], 1);
+    assert.equal(res.json["balanced"], true);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("the ledger export refuses to report unbalanced books", async () => {
+  const started = await start({ signer: new FakeSigner() });
+  try {
+    await seedAndRun(started.call, { usdCents: 150_000 });
+    // Simulate a torn write: a credit with no matching debit.
+    started.store.journalEntries.push({
+      id: "je_torn",
+      orgId: "org_1",
+      kind: "payment_settled",
+      memo: "torn",
+      createdAt: new Date().toISOString(),
+      postings: [{ account: "asset:stablecoin_clearing", direction: "credit", amount: 5n, currency: "usdc" }],
+    });
+    const res = await started.call("/v1/ledger?orgId=org_1", "GET");
+    assert.equal(res.status, 500);
+  } finally {
+    started.server.close();
+  }
+});

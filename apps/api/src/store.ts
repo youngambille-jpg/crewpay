@@ -1,4 +1,5 @@
 import type { AgentTask, Approval, ChainAsset, Invoice, Operation, PayRun, PayRunItem, Payee, Policy } from "@crewpay/domain";
+import type { JournalEntry } from "@crewpay/ledger";
 
 export interface Store {
   payees: Map<string, Payee>;
@@ -18,6 +19,12 @@ export interface Store {
   webhookEvents: Map<string, { type: string; at: string }>;
   /** Agent tasks, by id. A task is the claim; its payout is the money movement. */
   agentTasks: Map<string, AgentTask>;
+  /**
+   * Every journal entry written, in insertion order. Money movement is only
+   * real if the books record it, so the entries are stored rather than returned
+   * and dropped.
+   */
+  journalEntries: JournalEntry[];
 }
 
 export function createStore(): Store {
@@ -34,6 +41,7 @@ export function createStore(): Store {
     invoicePayRuns: new Map(),
     webhookEvents: new Map(),
     agentTasks: new Map(),
+    journalEntries: [],
   };
 }
 

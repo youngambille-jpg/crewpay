@@ -196,10 +196,11 @@ POST   /v1/webhooks/pingpay            payment settled -> trigger pay run / reco
 POST   /v1/agent-tasks                 pay an agent per task (x402 quote/deposit/settle)
 GET    /v1/agent-tasks                 agent tasks (?orgId=)
 GET    /v1/exports/agent-payments      1099-style roll-up by payee (?orgId=&year=)
+GET    /v1/ledger                      journal entries + trial balance + attestation (?orgId=)
 ```
 
 Planned but not yet implemented: `POST /v1/webhooks/1click` (swap status
-transitions) and `GET /v1/ledger` (journal export + attestations).
+transitions).
 
 ## Design rules
 
@@ -232,3 +233,9 @@ transitions) and `GET /v1/ledger` (journal export + attestations).
    then settles over x402 (quote → deposit → settle) with one token across
    retries — done (`/v1/agent-tasks`, `/v1/exports/agent-payments`).
 9. Treasury: Earn, limit orders, sweeps. Accounting exports.
+10. Ledger export: journal entries, a trial balance that must net to zero per
+    currency, and a content-hash attestation — done (`/v1/ledger`). Journal
+    entries are now persisted in the store; before this they were produced by
+    the pay run and agent paths and then dropped, so there was nothing to
+    export. The endpoint refuses (500) rather than report books containing an
+    unbalanced entry.
