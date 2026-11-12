@@ -96,6 +96,7 @@ export async function payAgentTask(
 
   const txHash = funding?.kind === "deposited" ? funding.proof.txHash : `unfunded_${quote.operationToken}`;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  let lastIncomplete: { reason: string; depositAddress: string } | undefined;
 
   for (let attempt = 0; attempt < MAX_SETTLE_ATTEMPTS; attempt += 1) {
     const result = await deps.agentpay.settle({ quote, txHash });
@@ -119,14 +120,29 @@ export async function payAgentTask(
       return { status: "failed", reason: result.reason, decision };
     }
     if (result.status === "incomplete") {
-      // The challenge is still active. A real deployment tops the deposit up
-      // here; we retry the same token, which is the safe half of that.
+      // The deposit landed short. Ping keeps the challenge active, so the token
+      // is still good and retrying is safe — no new money moves. But the
+      // documented remedy is to *top the deposit up*, and the shortfall is not
+      // in the response, so a retry alone cannot clear a genuinely short
+      // deposit. We retry anyway in case the remainder is still in flight, then
+      // escalate with the address and token needed to finish it by hand.
+      lastIncomplete = { reason: result.reason, depositAddress: result.depositAddress };
       await sleep(250 * (attempt + 1));
       continue;
     }
     // pending: same token, backoff.
     const delay = (result.retryAfterSeconds ?? 1) * 1000;
     await sleep(delay);
+  }
+
+  if (lastIncomplete) {
+    return {
+      status: "needs_review",
+      reason:
+        `deposit short (INCOMPLETE_DEPOSIT) at ${lastIncomplete.depositAddress}; ` +
+        `top it up and retry settle with the same operation token (${quote.operationToken})`,
+      decision,
+    };
   }
 
   return {

@@ -135,6 +135,19 @@ test("a short deposit is retried on the same token until it settles", async () =
   assert.equal(new Set(agentpay.settleCalls.map((c) => c.operationToken)).size, 1);
 });
 
+test("a short deposit that never clears escalates with the top-up it needs", async () => {
+  // A retry cannot clear a short deposit on its own: the documented remedy is to
+  // top the address up. Exhausting the budget must surface the address and the
+  // token, not a generic "did not settle", or the money is stranded silently.
+  const agentpay = new FakeAgentPay({ incompleteSettles: 99 });
+  const outcome = await payAgentTask(task(), policy(), deps(agentpay, { signer: new FakeSigner() }));
+  assert.equal(outcome.status, "needs_review");
+  assert.match(outcome.reason, /INCOMPLETE_DEPOSIT/);
+  assert.match(outcome.reason, /top it up/);
+  // The token is quoted once and reused: re-quoting would abandon a live deposit.
+  assert.equal(new Set(agentpay.settleCalls.map((c) => c.operationToken)).size, 1);
+});
+
 test("a terminal settlement failure is not retried", async () => {
   const agentpay = new FakeAgentPay({ failSettles: true });
   const outcome = await payAgentTask(task(), policy(), deps(agentpay, { signer: new FakeSigner() }));

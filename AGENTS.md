@@ -313,9 +313,19 @@ suite must stay offline and deterministic. Run it by hand or on a schedule.
   `{x402Version:2, paymentPayload:{payload:{type:"quote",refundTo}}, paymentRequirements:offer}`;
   `settle` adds `operationToken`, `depositAddress`, `txHash` (and `depositMemo`
   when the origin rail needs one). No drift found.
-- **Known gap, not yet closed:** `INCOMPLETE_DEPOSIT` retries the same token but
-  does **not** top the deposit up. That is the safe half only — a short deposit
-  cannot succeed unattended.
+- **`interpretSettle` was verified against the live wire and is correct.** The
+  settle response uses `errorReason`/`errorMessage`/`extra.status`, and
+  `settlement_pending` and `unknown_payto` both map as intended. Unlike
+  verify's error field, the docs were accurate here.
+- **`INCOMPLETE_DEPOSIT` is a top-up, not a retry.** Docs: the challenge stays
+  active, so **top up the same deposit address and retry settle with the same
+  token**. Re-posting a consumed challenge with the same proof is idempotent.
+  The retry loop now retries the same token (safe — no new money moves) and, if
+  it still has not cleared when the budget runs out, escalates to
+  `needs_review` naming the deposit address and operation token. It does **not**
+  auto-top-up: the shortfall is not in the response, `FundingPlan` holds no
+  post-deposit balance, and inventing an amount would mean sending real funds
+  blind. A real top-up needs a wallet balance read that does not exist yet.
 
 ## Status
 
