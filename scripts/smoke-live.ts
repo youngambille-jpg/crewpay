@@ -300,6 +300,25 @@ async function checkPingPayAuthed(): Promise<void> {
   const f = timeoutFetch();
   const client = new PingPayClient({ publishableKey: PING_API_KEY, baseUrl: `${PING_URL}/api`, fetchImpl: f });
 
+  // 0. The registration endpoint is the org's own view of readiness, and it is
+  //    the only place the *specific* blocking reason appears. Reporting it turns
+  //    a vague "not configured" into the exact next action.
+  try {
+    const res = await f(`${PING_URL}/api/agentpay/registration`, { headers: { "x-api-key": PING_API_KEY } });
+    const reg = (await res.json()) as Record<string, unknown>;
+    if (reg["valid"] === true) {
+      pass("GET /agentpay/registration", "org ready: enabled, valid, recipient configured");
+    } else {
+      warn(
+        "GET /agentpay/registration",
+        `enabled=${reg["enabled"]} valid=${reg["valid"]} recipientConfigured=${reg["recipientConfigured"]}` +
+          (reg["error"] ? ` — ${reg["error"]}` : ""),
+      );
+    }
+  } catch (e) {
+    warn("GET /agentpay/registration", `could not read readiness: ${(e as Error).message}`);
+  }
+
   // 1. The checkout route is the one that carried a wrong header name. A 401
   //    here is a real regression; a 400 about the recipient is external state.
   try {
@@ -336,7 +355,7 @@ async function checkPingPayAuthed(): Promise<void> {
     if (status === 401) {
       fail("POST /agentpay/x402/offers", `401 — key rejected: ${(e as Error).message}`);
     } else if (code === "agent_pay_misconfigured") {
-      warn("POST /agentpay/x402/offers", "auth OK, org not configured (Settings → choose receive asset + recipient)");
+      warn("POST /agentpay/x402/offers", `auth OK, org not ready — ${(e as Error).message}`);
     } else {
       fail("POST /agentpay/x402/offers", `unexpected: ${(e as Error).message}`);
     }

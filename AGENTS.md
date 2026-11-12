@@ -281,13 +281,18 @@ suite must stay offline and deterministic. Run it by hand or on a schedule.
   every fixture test passed anyway, because the mock accepted any header. Fixed;
   this is the single best argument for the smoke test existing.
 - **A valid PingPay key still cannot complete a run until the org is
-  configured.** `GET /api/agentpay/registration` reports
-  `{enabled:false, valid:false, recipientConfigured:false}`, and both the
-  checkout and the facilitator answer `agent_pay_misconfigured` / "no recipient
-  address configured". Auth passes; the org has no receive asset or recipient
-  set. That is dashboard work (Settings → choose the asset you receive), not
-  code. `GET /api/checkout/sessions/{id}` with no key returns 404, not 401 —
-  the session id space is not an auth oracle.
+  configured.** `GET /api/agentpay/registration` is the only place the
+  *specific* blocking reason appears, so the smoke test reports it verbatim.
+  Observed states, in order: `{enabled:false, valid:false,
+  recipientConfigured:false}` → then `{enabled:true, valid:false,
+  recipientConfigured:true, error:"Your Intents balance uses the NEAR account
+  saved under Recipient Addresses. Add that account before agents can pay."}`.
+  So `recipientConfigured` gates the checkout route and the *balance-backed*
+  NEAR account gates the facilitator — two different checks. Nothing is
+  settable over the API (`/api/settings`, `/api/org`, `/api/account`, `/api/me`,
+  `/api/config` all 404); it is dashboard state.
+  `GET /api/checkout/sessions/{id}` with no key returns 404, not 401 — the
+  session id space is not an auth oracle.
 - **x402 request shapes match the docs field-for-field.** `verify` body is
   `{x402Version:2, paymentPayload:{payload:{type:"quote",refundTo}}, paymentRequirements:offer}`;
   `settle` adds `operationToken`, `depositAddress`, `txHash` (and `depositMemo`
