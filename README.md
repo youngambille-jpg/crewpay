@@ -37,7 +37,7 @@ No build step and no runtime dependencies are needed for the core packages.
 
 ```bash
 npm install        # links the workspace packages
-npm test           # 82 tests across policy, ledger, rails, signer, agent and api
+npm test           # 94 tests across policy, ledger, rails, signer, agent and api
 npm run demo       # end-to-end pay run against the FakeRail + FakeSigner
 npm run test:signer    # signer outcome and idempotency tests only
 npm run verify:tokens  # check the pinned asset table against live 1Click
@@ -46,8 +46,8 @@ npm run typecheck  # strict tsc, no emit
 
 The demo seeds four payees and runs one pay run. Expected result: one contractor
 settles (with a deposit proof), one operation's funding is escalated to
-`needsReview`, one vendor over the approval threshold goes to approval, and one
-agent payee over the per-kind cap is denied.
+`needsReview`, one vendor over the approval threshold opens an approval that is
+then approved and executed, and one agent payee over the per-kind cap is denied.
 
 ## Design rules
 
@@ -68,8 +68,10 @@ agent payee over the per-kind cap is denied.
    against recorded fixtures, asset table drift-guarded).
 4. `signer`: OutLayer TEE custody funds the deposit and passes a `DepositProof`
    to `submit` — done (`packages/signer`, four-way funding outcome, idempotent).
-5. OutLayer policy manifest: the org policy as an on-chain manifest, approval
-   tasks for `allow_with_approval`.
-6. PingPay integration: invoice checkout + webhook → auto pay run.
-7. Agent payees via x402/MPP per-task settlement.
-8. Treasury: Earn, limit orders, sweeps. Accounting exports.
+5. Approvals inbox: frozen operation, approve/reject/execute, re-validated
+   against the current policy at execution — done (`/v1/approvals`).
+6. OutLayer policy manifest: the org policy as an on-chain manifest, multisig
+   tasks mirroring the inbox.
+7. PingPay integration: invoice checkout + webhook → auto pay run.
+8. Agent payees via x402/MPP per-task settlement.
+9. Treasury: Earn, limit orders, sweeps. Accounting exports.

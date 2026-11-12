@@ -1,9 +1,9 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import type { Operation, PayRunItem, Payee, Policy } from "@crewpay/domain";
+import type { Approval, Operation, PayRun, PayRunItem, Payee, Policy } from "@crewpay/domain";
 import { defaultRules, corridor } from "@crewpay/domain";
 import type { SettlementRail } from "@crewpay/rails";
 import type { Signer } from "@crewpay/signer";
-import { executeRun } from "@crewpay/agent";
+import { executeApproved, executeRun } from "@crewpay/agent";
 import { activePolicy, createStore, type Store } from "./store.ts";
 
 export interface ApiDeps {
@@ -39,7 +39,12 @@ function readJson(req: IncomingMessage): Promise<unknown> {
 }
 
 function send(res: ServerResponse, status: number, body: unknown): void {
-  const payload = JSON.stringify(body);
+  // Money is bigint everywhere inside the app. JSON has no integer type that
+  // is safe for it, so it crosses the wire as a string and the client parses
+  // it — never as a float, which would round.
+  const payload = JSON.stringify(body, (_key, value) =>
+    typeof value === "bigint" ? value.toString() : value,
+  );
   res.writeHead(status, { "content-type": "application/json" });
   res.end(payload);
 }
@@ -84,13 +89,21 @@ async function handle(
 
   if (method === "POST" && url.pathname === "/v1/policies") {
     const body = (await readJson(req)) as Partial<Policy> & { orgId: string };
+    const previous = activePolicy(store, body.orgId);
     const policy: Policy = {
       id: body.id ?? `pol_${store.policies.size + 1}`,
       orgId: body.orgId,
-      version: body.version ?? 1,
+      // Each POST publishes a new version, so a decision can always be traced
+      // to the rules in force when it was made.
+      version: body.version ?? (previous ? previous.version + 1 : 1),
       active: body.active ?? true,
       rules: body.rules ?? defaultRules(),
     };
+    // Exactly one active policy per org: the new version supersedes the old,
+    // otherwise a stale policy would keep authorising operations.
+    if (policy.active && previous) {
+      store.policies.set(previous.id, { ...previous, active: false });
+    }
     store.policies.set(policy.id, policy);
     return send(res, 201, policy);
   }
@@ -153,6 +166,34 @@ async function handle(
         store.payeeHistory.set(outcome.payeeId, (store.payeeHistory.get(outcome.payeeId) ?? 0) + 1);
       }
     }
+    store.settledTodayCents.set(
+      body.orgId,
+      (store.settledTodayCents.get(body.orgId) ?? 0) + result.settledCents,
+    );
+
+    // Open an approval for each operation the policy held back, freezing the
+    // operation as it was evaluated. The approver signs off on exactly this.
+    const approvalIds: string[] = [];
+    for (const outcome of result.outcomes) {
+      if (outcome.decision.decision !== "allow_with_approval") continue;
+      const operation = store.operations.get(outcome.operationId);
+      if (!operation) continue;
+      const approval: Approval = {
+        id: `apv_${store.approvals.size + 1}`,
+        orgId: body.orgId,
+        operationId: operation.id,
+        operation,
+        payeeId: outcome.payeeId,
+        policyId: outcome.decision.policyId,
+        policyVersion: outcome.decision.policyVersion,
+        reasonCodes: outcome.decision.reasons.map((r) => r.code),
+        status: "pending",
+        requestedBy: "api",
+        requestedAt: new Date().toISOString(),
+      };
+      store.approvals.set(approval.id, approval);
+      approvalIds.push(approval.id);
+    }
 
     const run = {
       id: runId,
@@ -177,6 +218,7 @@ async function handle(
       run,
       settledCents: result.settledCents,
       awaitingApproval: result.awaitingApproval,
+      approvals: approvalIds,
       denied: result.denied,
       failed: result.failed,
       needsReview: result.needsReview,
@@ -186,6 +228,72 @@ async function handle(
 
   if (method === "GET" && url.pathname === "/v1/pay-runs") {
     return send(res, 200, [...store.payRuns.values()]);
+  }
+
+  if (method === "GET" && url.pathname === "/v1/approvals") {
+    const orgId = url.searchParams.get("orgId");
+    const status = url.searchParams.get("status");
+    const all = [...store.approvals.values()].filter(
+      (a) => (!orgId || a.orgId === orgId) && (!status || a.status === status),
+    );
+    return send(res, 200, all);
+  }
+
+  const decisionMatch = /^\/v1\/approvals\/([^/]+)\/(approve|reject|execute)$/.exec(url.pathname);
+  if (method === "POST" && decisionMatch) {
+    const [, id, action] = decisionMatch;
+    const approval = store.approvals.get(id!);
+    if (!approval) return send(res, 404, { error: "approval not found" });
+
+    if (action === "approve" || action === "reject") {
+      // Only a pending approval can be decided; a second decision is a
+      // conflict, not a no-op, so a lost response cannot flip an outcome.
+      if (approval.status !== "pending") {
+        return send(res, 409, { error: `approval is ${approval.status}, not pending` });
+      }
+      const body = (await readJson(req)) as { decidedBy?: string; note?: string };
+      const decided: Approval = {
+        ...approval,
+        status: action === "approve" ? "approved" : "rejected",
+        decidedBy: body.decidedBy ?? "unknown",
+        decidedAt: new Date().toISOString(),
+        ...(body.note ? { note: body.note } : {}),
+      };
+      store.approvals.set(approval.id, decided);
+      return send(res, 200, decided);
+    }
+
+    // execute: requires an approval, and re-checks the current policy.
+    if (approval.status !== "approved") {
+      return send(res, 409, { error: `approval is ${approval.status}, not approved` });
+    }
+    const policy = activePolicy(store, approval.orgId);
+    if (!policy) return send(res, 400, { error: "no active policy for org" });
+
+    const result = await executeApproved(approval, {
+      policy,
+      rail: deps.rail,
+      ...(deps.signer ? { signer: deps.signer } : {}),
+      lookupPayee: (payeeId) => store.payees.get(payeeId),
+      payeeHasHistory: (payeeId) => (store.payeeHistory.get(payeeId) ?? 0) > 0,
+      spentTodayCents: store.settledTodayCents.get(approval.orgId) ?? 0,
+    });
+
+    store.approvals.set(approval.id, result.approval);
+    if (result.status === "executed") {
+      store.payeeHistory.set(approval.payeeId, (store.payeeHistory.get(approval.payeeId) ?? 0) + 1);
+      store.settledTodayCents.set(
+        approval.orgId,
+        (store.settledTodayCents.get(approval.orgId) ?? 0) + approval.operation.usdCents,
+      );
+    }
+
+    const status = result.status === "executed" ? 200 : 409;
+    return send(res, status, {
+      status: result.status,
+      approval: result.approval,
+      ...(result.reasons ? { reasons: result.reasons } : {}),
+    });
   }
 
   return send(res, 404, { error: "not found" });

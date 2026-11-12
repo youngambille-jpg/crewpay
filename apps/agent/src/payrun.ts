@@ -1,7 +1,7 @@
-import type { Operation, PayRunItem, Payee, Policy } from "@crewpay/domain";
+import type { Approval, Operation, PayRunItem, Payee, Policy } from "@crewpay/domain";
 import { type DecisionResult, evaluate, type DecisionContext } from "@crewpay/policy";
 import { paymentSettled, type JournalEntry } from "@crewpay/ledger";
-import type { SettlementRail, DepositProof, SettlementStatus } from "@crewpay/rails";
+import type { SettlementRail, DepositProof, SettlementStatus, SettlementResult } from "@crewpay/rails";
 import type { FundingOutcome, Signer } from "@crewpay/signer";
 
 /** How many times to poll a rail before giving up on an in-flight settlement. */
@@ -17,7 +17,7 @@ export interface OperationOutcome {
   readonly payeeId: string;
   readonly decision: DecisionResult;
   /** Present once a payable operation reaches a terminal state. */
-  readonly settlement?: Awaited<ReturnType<SettlementRail["poll"]>>;
+  readonly settlement?: SettlementResult;
   /** How funding went, when the operation got as far as the signer. */
   readonly funding?: FundingOutcome;
   readonly journal?: JournalEntry;
@@ -41,6 +41,78 @@ export interface RunDeps {
   readonly lookupPayee: (payeeId: string) => Payee | undefined;
   /** True if the payee has at least one previously settled payment. */
   readonly payeeHasHistory: (payeeId: string) => boolean;
+}
+
+/**
+ * How one operation ended, independent of why it was authorised. `settled`
+ * carries the journal entry; the rest say what a caller must do next. The
+ * funding detail travels with every variant so the caller can record the
+ * deposit proof, or the reason funding did not complete.
+ */
+export type SettlementOutcome =
+  | {
+      readonly kind: "settled";
+      readonly settlement: SettlementResult;
+      readonly journal: JournalEntry;
+      readonly funding?: FundingOutcome;
+    }
+  | { readonly kind: "failed"; readonly settlement?: SettlementResult; readonly funding?: FundingOutcome }
+  | { readonly kind: "needs_review"; readonly settlement?: SettlementResult; readonly funding?: FundingOutcome };
+
+/**
+ * Move one already-authorised operation: quote, fund the deposit, submit, then
+ * poll to a terminal state. This is the only place money moves, so both the pay
+ * run and an approved operation go through it and cannot drift apart.
+ *
+ * Funding is checked before submit because a funding outcome that is not
+ * `deposited` must stop here: retrying unknown-state funding can move funds
+ * twice.
+ */
+export async function settleOperation(
+  orgId: string,
+  operation: Operation,
+  deps: Pick<RunDeps, "rail" | "signer">,
+): Promise<SettlementOutcome> {
+  const quote = await deps.rail.quote(operation);
+
+  let proof: DepositProof | undefined;
+  let funded: FundingOutcome | undefined;
+  if (deps.signer) {
+    const plan = deps.signer.plan(operation, quote);
+    const funding = await deps.signer.fund(operation, quote, plan);
+    if (funding.kind === "needs_review" || funding.kind === "pending") {
+      return { kind: "needs_review", funding };
+    }
+    if (funding.kind === "failed") {
+      return { kind: "failed", funding };
+    }
+    proof = funding.proof;
+    funded = funding;
+  }
+
+  let settlement = await deps.rail.submit(operation, quote, proof);
+  for (let attempt = 0; attempt < MAX_POLLS && isInFlight(settlement.status); attempt += 1) {
+    settlement = await deps.rail.poll(operation.id, quote);
+  }
+
+  if (settlement.status === "settled") {
+    const journal = paymentSettled({
+      id: `je_${operation.id}`,
+      orgId,
+      amount: quote.amountOut,
+      fee: quote.feeIn,
+      currency: operation.destination.asset,
+      memo: `${operation.type} ${operation.id} settled`,
+    });
+    return { kind: "settled", settlement, journal, ...(funded ? { funding: funded } : {}) };
+  }
+
+  if (settlement.status === "failed" || settlement.status === "refunded") {
+    return { kind: "failed", settlement, ...(funded ? { funding: funded } : {}) };
+  }
+
+  // Still in flight after the poll budget: not a failure, needs attention.
+  return { kind: "needs_review", settlement, ...(funded ? { funding: funded } : {}) };
 }
 
 /**
@@ -87,70 +159,106 @@ export async function executeRun(
       continue;
     }
 
-    const quote = await deps.rail.quote(operation);
-
-    // Fund the deposit before telling the rail it was funded. A funding outcome
-    // that is not "deposited" must stop here: retrying an unknown-state funding
-    // can move funds twice, so it is escalated rather than retried.
-    let proof: DepositProof | undefined;
-    let funded: FundingOutcome | undefined;
-    if (deps.signer) {
-      const plan = deps.signer.plan(operation, quote);
-      const funding = await deps.signer.fund(operation, quote, plan);
-      if (funding.kind === "needs_review") {
-        needsReview.push(operation.id);
-        outcomes.push({ operationId: operation.id, payeeId: item.payeeId, decision, funding });
-        continue;
-      }
-      if (funding.kind === "pending") {
-        // In flight, not failed: leave it unsettled and let a later run or the
-        // approvals inbox resolve it rather than reporting a false failure.
-        needsReview.push(operation.id);
-        outcomes.push({ operationId: operation.id, payeeId: item.payeeId, decision, funding });
-        continue;
-      }
-      if (funding.kind === "failed") {
-        failed.push(operation.id);
-        outcomes.push({ operationId: operation.id, payeeId: item.payeeId, decision, funding });
-        continue;
-      }
-      proof = funding.proof;
-      funded = funding;
-    }
-
-    let settlement = await deps.rail.submit(operation, quote, proof);
-    for (let attempt = 0; attempt < MAX_POLLS && isInFlight(settlement.status); attempt += 1) {
-      settlement = await deps.rail.poll(operation.id, quote);
-    }
-
-    if (settlement.status === "settled") {
+    const result = await settleOperation(orgId, operation, deps);
+    if (result.kind === "settled") {
       spentTodayCents += operation.usdCents;
       settledCents += operation.usdCents;
-      const journal = paymentSettled({
-        id: `je_${operation.id}`,
-        orgId,
-        amount: quote.amountOut,
-        fee: quote.feeIn,
-        currency: operation.destination.asset,
-        memo: `${operation.type} ${operation.id} settled`,
-      });
       outcomes.push({
         operationId: operation.id,
         payeeId: item.payeeId,
         decision,
-        settlement,
-        journal,
-        ...(funded ? { funding: funded } : {}),
+        settlement: result.settlement,
+        journal: result.journal,
+        ...(result.funding ? { funding: result.funding } : {}),
       });
-    } else if (settlement.status === "failed" || settlement.status === "refunded") {
+    } else if (result.kind === "failed") {
       failed.push(operation.id);
-      outcomes.push({ operationId: operation.id, payeeId: item.payeeId, decision, settlement });
+      outcomes.push({
+        operationId: operation.id,
+        payeeId: item.payeeId,
+        decision,
+        ...(result.settlement ? { settlement: result.settlement } : {}),
+        ...(result.funding ? { funding: result.funding } : {}),
+      });
     } else {
-      // Still in flight after the poll budget: not a failure, needs attention.
       needsReview.push(operation.id);
-      outcomes.push({ operationId: operation.id, payeeId: item.payeeId, decision, settlement });
+      outcomes.push({
+        operationId: operation.id,
+        payeeId: item.payeeId,
+        decision,
+        ...(result.settlement ? { settlement: result.settlement } : {}),
+        ...(result.funding ? { funding: result.funding } : {}),
+      });
     }
   }
 
   return { outcomes, settledCents, awaitingApproval, denied, failed, needsReview };
+}
+
+export interface ExecuteApprovedDeps extends Pick<RunDeps, "rail" | "signer" | "lookupPayee" | "payeeHasHistory"> {
+  /** The policy currently in force for the org. */
+  readonly policy: Policy;
+  /** USD cents already committed today, for the daily cap. */
+  readonly spentTodayCents?: number;
+  readonly hour?: number;
+}
+
+export interface ExecuteApprovedResult {
+  readonly status: "executed" | "failed" | "needs_review" | "stale";
+  readonly approval: Approval;
+  readonly journal?: JournalEntry;
+  readonly reasons?: readonly string[];
+}
+
+/**
+ * Execute an approved operation. The human gate is already cleared, so this
+ * does not ask for approval again — but it does re-run the policy engine,
+ * because an approval authorises a payment, not a bypass.
+ *
+ * Two things can have changed since the request: the operation's payee (now
+ * blocked, or re-screened as a hit) and the policy itself (a lowered cap, or a
+ * corridor removed). Either turns the approval `stale` rather than paying,
+ * because the approver agreed to different terms than the ones now in force.
+ */
+export async function executeApproved(
+  approval: Approval,
+  deps: ExecuteApprovedDeps,
+): Promise<ExecuteApprovedResult> {
+  const { operation } = approval;
+  const payee = deps.lookupPayee(approval.payeeId);
+  const decision = evaluate(operation, deps.policy, {
+    payee,
+    spentTodayCents: deps.spentTodayCents ?? 0,
+    payeeHasHistory: deps.payeeHasHistory(approval.payeeId),
+    hour: deps.hour ?? 12,
+  });
+
+  if (decision.decision === "deny") {
+    return {
+      status: "stale",
+      approval: { ...approval, status: "stale", note: "policy now denies this operation" },
+      reasons: decision.reasons.map((r) => r.code),
+    };
+  }
+
+  const result = await settleOperation(approval.orgId, operation, deps);
+  if (result.kind === "settled") {
+    return {
+      status: "executed",
+      approval: { ...approval, status: "executed" },
+      journal: result.journal,
+    };
+  }
+  if (result.kind === "failed") {
+    return {
+      status: "failed",
+      approval: {
+        ...approval,
+        status: "failed",
+        ...(result.funding && result.funding.kind === "failed" ? { note: result.funding.reason } : {}),
+        ...(result.settlement?.failureReason ? { note: result.settlement.failureReason } : {}),
+      },
+    };
+  }
+  return { status: "needs_review", approval: { ...approval, status: "executing" } };
 }

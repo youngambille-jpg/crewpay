@@ -69,7 +69,10 @@ POST   /v1/pay-runs                    create a pay run from a source (csv|api|i
 POST   /v1/pay-runs/:id/submit         hand the run to the agent
 GET    /v1/pay-runs/:id                run status, per-item state, receipts
 GET    /v1/operations                  list operations + policy decisions
+GET    /v1/approvals                   approvals inbox (?orgId=&status=)
 POST   /v1/approvals/:id/approve       one-signature owner approval
+POST   /v1/approvals/:id/reject        decline, with a reason
+POST   /v1/approvals/:id/execute       pay an approved operation (re-checks policy)
 POST   /v1/invoices                    issue an invoice (PingPay checkout)
 POST   /v1/webhooks/pingpay            payment settled -> trigger pay run / reconcile
 POST   /v1/webhooks/1click             swap status transitions
@@ -206,6 +209,42 @@ answers with a request id to poll instead of holding the connection open.
 status. `pending_approval` is deliberately *not* polled: a multisig wallet
 settles it only when a human votes, so polling would spin until a false
 escalation.
+
+### 3.5a Approval workflow
+
+An `allow_with_approval` decision does not pay and does not disappear: it opens
+an `Approval` in the inbox and the operation stays unpaid until a human decides
+it. Three properties make this safe rather than a second, weaker path to money.
+
+**The operation is frozen.** The approval stores a snapshot of the `Operation`
+as it was evaluated, not a reference to live state. An approver signs off on an
+exact amount, recipient and corridor, and a later edit to a pay run cannot widen
+what they agreed to. `policyId`/`policyVersion` are recorded alongside so the
+audit trail shows the rules in force at decision time.
+
+**Approval clears the human gate, not the policy gate.** `executeApproved`
+re-runs the policy engine against the *current* active policy before paying.
+Two things may have changed since the request: the payee (now blocked, or
+re-screened as a hit) or the policy (a lowered cap, a corridor removed). Either
+turns the approval `stale` — a 409 with the reason codes — rather than paying,
+because the approver agreed to different terms than the ones now in force.
+
+**One decision, one payment.** `pending` is the only status that can be
+decided; a second approve/reject is a 409 conflict, not a silent flip, so a
+retried request cannot reverse a decision. `executed`, `rejected` and `stale`
+are final, and execution requires `approved`, so a replayed `execute` cannot
+pay twice. The money path itself is shared with the pay run — both call
+`settleOperation`, so an approved payment cannot drift from an ordinary one.
+
+The `ApprovalStatus` lifecycle:
+
+```
+pending ──approve──▶ approved ──execute──▶ executed
+   │                    │            └────▶ failed      (funding/rail failed)
+   │                    └─────────────────▶ needs_review (unknown fund state)
+   ├──reject──▶ rejected
+   └──(policy changed at execute time)────▶ stale
+```
 
 ### 3.6 `store` — Postgres
 
@@ -362,6 +401,10 @@ at `https://1click.chaindefuser.com/docs/v0/openapi.yaml`.
 - **Unknown fund state is never retried.** A funding failure is retried only
   when the service says no funds moved; anything unresolved is escalated to a
   human, because a blind retry can double-spend.
+- **An approval authorises a payment, not a bypass.** Execution re-runs the
+  policy engine, and a payee or policy change since the request makes the
+  approval stale instead of paying. The operation is frozen at request time, so
+  what the approver saw is what executes.
 - **Least privilege.** API keys are scoped (`read`, `payroll:write`,
   `approvals:write`). Approvals require an `approver` member.
 - **Auditability.** Decisions store the policy version; receipts link to chain
@@ -391,12 +434,14 @@ agent worker (Node)  ─┘        │
 6. **Signer (`packages/signer`)** — OutLayer TEE wallet funds the deposit and
    returns a `DepositProof`; four-way funding outcome so a retry never
    double-pays.
-7. **OutLayer policy manifest + approval tasks** — the org policy as an on-chain
-   manifest, multisig inbox for `allow_with_approval`.
-8. **PingPay integration** — invoice checkout + webhook → auto pay run.
-9. **Agent payees** — x402/MPP per-task settlement + 1099-style export.
-10. **Treasury** — Earn, limit orders, sweeps.
-11. **Accounting exports** — QuickBooks/Xero sync, attestation bundle.
+7. **Approval workflow** — `Approval` inbox with approve/reject/execute; a
+   frozen operation, re-validated against the current policy at execution.
+8. **OutLayer policy manifest** — the org policy as an on-chain manifest,
+   multisig tasks mirroring the inbox.
+9. **PingPay integration** — invoice checkout + webhook → auto pay run.
+10. **Agent payees** — x402/MPP per-task settlement + 1099-style export.
+11. **Treasury** — Earn, limit orders, sweeps.
+12. **Accounting exports** — QuickBooks/Xero sync, attestation bundle.
 
 ## 10. Deliberately out of scope (v1)
 

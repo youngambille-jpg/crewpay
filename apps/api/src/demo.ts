@@ -65,5 +65,20 @@ const result = await post("/v1/pay-runs", {
   ],
 });
 
-console.log(JSON.stringify(result, null, 2));
+console.log("pay run:", JSON.stringify(result, null, 2));
+
+// The vendor is over the threshold, so it opened an approval instead of paying.
+// A human decides, then the approved operation executes.
+const run = result as { approvals: string[] };
+const approvalId = run.approvals[0]!;
+
+const inbox = await (await fetch(`${base}/v1/approvals?orgId=org_1`)).json();
+console.log("inbox:", JSON.stringify(inbox, null, 2));
+
+const decided = await post(`/v1/approvals/${approvalId}/approve`, { decidedBy: "owner@acme" });
+console.log("approved:", JSON.stringify(decided, null, 2));
+
+const executed = await post(`/v1/approvals/${approvalId}/execute`, {});
+console.log("executed:", JSON.stringify(executed, null, 2));
+
 server.close();

@@ -126,10 +126,39 @@ There is no build step. There are no runtime dependencies in the core packages.
   adding one, re-run `npm install` to create the `node_modules/@crewpay/*`
   symlink, and confirm `tsc` resolves the import.
 
+## Approval workflow notes
+
+- An approval stores a **frozen copy** of the operation, not a reference. Never
+  re-read the operation from the store at execute time — that would let a later
+  edit widen what the approver agreed to.
+- `executeApproved` re-runs `evaluate()` against the **current** active policy
+  before paying. An approval clears the human gate only. If the result is `deny`
+  the approval becomes `stale` (HTTP 409) and pays nothing.
+- Status is the guard against double payment: only `pending` can be decided,
+  only `approved` can execute. `executed`/`rejected`/`stale` are final. A second
+  decision is a 409 conflict, not a no-op — do not "fix" this into an idempotent
+  200.
+- The money path is shared: both `executeRun` and `executeApproved` call
+  `settleOperation`. Never add a second funding/submit path; that is how the two
+  drift and one loses the double-spend guard.
+- Only one policy per org is active. Posting `/v1/policies` deactivates the
+  previous version and bumps `version`; `activePolicy()` returns the first match
+  and would otherwise keep returning the stale one.
+
+## JSON and money notes
+
+- `bigint` cannot be `JSON.stringify`-ed (`TypeError: Do not know how to
+  serialize a BigInt`). The API's `send()` passes a replacer that stringifies
+  bigint, so amounts cross the wire as strings. A new response that embeds a raw
+  domain object (an `Operation`, say) needs this or it 500s.
+- HTTP status conventions in the API: 201 create, 200 ok, 400 bad request, 404
+  not found, **409 for a state conflict** (wrong approval status, stale
+  approval, failed execution).
+
 ## Status
 
 Done and tested: `domain`, `policy`, `ledger`, `rails` (incl. 1Click adapter),
-`signer` (OutLayer TEE custody + FakeSigner), agent orchestration, api skeleton.
-82 tests.
-Not started: OutLayer policy manifest + approval tasks, PingPay, x402/MPP agent
-payouts, Postgres persistence, web UI.
+`signer` (OutLayer TEE custody + FakeSigner), agent orchestration, api skeleton,
+approvals inbox. 94 tests.
+Not started: OutLayer policy manifest, PingPay, x402/MPP agent payouts,
+Postgres persistence, web UI.
