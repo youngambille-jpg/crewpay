@@ -20,7 +20,7 @@ import type { Signer } from "@crewpay/signer";
 import { compileManifest, diffManifest, type ManifestDrift } from "@crewpay/signer";
 import { executeApproved, executeRun, payAgentTask } from "@crewpay/agent";
 import { allBalanced, attestation, trialBalance } from "@crewpay/ledger";
-import { activePolicy, createStore, type Store } from "./store.ts";
+import { activePolicy, createStore, recordFunding, type Store } from "./store.ts";
 
 export interface ApiDeps {
   readonly rail: SettlementRail;
@@ -146,6 +146,9 @@ async function createPayRun(
     // Persist the books for every settled line. A settlement the journal does
     // not record is money the export cannot show.
     if (outcome.journal) store.journalEntries.push(outcome.journal);
+    // Keep any funding we could not resolve: the request id is the only handle
+    // that can tell us later whether that money moved.
+    recordFunding(store, { orgId: body.orgId, operationId: outcome.operationId }, outcome.funding);
   }
   store.settledTodayCents.set(
     body.orgId,
@@ -442,6 +445,28 @@ async function handle(
     return send(res, 200, await deps.signer.custody.openApprovals());
   }
 
+  if (method === "GET" && url.pathname === "/v1/custody/requests") {
+    // The worklist: funding requests we could not resolve. These are the ones
+    // where funds may have moved and the outcome we recorded is only a snapshot.
+    const orgId = url.searchParams.get("orgId");
+    const rows = [...store.fundingRequests.values()].filter((r) => !orgId || r.orgId === orgId);
+    return send(res, 200, rows);
+  }
+
+  if (method === "GET" && url.pathname.startsWith("/v1/custody/requests/")) {
+    // Re-read one request from the custody service. Read-only by design: the
+    // point is to learn the true state without moving money a second time, so
+    // this never re-submits, however the request looks.
+    const requestId = decodeURIComponent(url.pathname.slice("/v1/custody/requests/".length));
+    const record = store.fundingRequests.get(requestId);
+    if (!record) return send(res, 404, { error: "unknown funding request" });
+    if (!deps.signer?.reconcile) {
+      return send(res, 400, { error: "no reconciling signer configured", record });
+    }
+    const state = await deps.signer.reconcile(requestId);
+    return send(res, 200, { record, state });
+  }
+
   if (method === "GET" && url.pathname === "/v1/approvals") {
     const orgId = url.searchParams.get("orgId");
     const status = url.searchParams.get("status");
@@ -492,6 +517,13 @@ async function handle(
     });
 
     store.approvals.set(approval.id, result.approval);
+    // Record the funding handle whether the operation executed or not: a
+    // failed or unresolved funding is exactly the case that must be kept.
+    recordFunding(
+      store,
+      { orgId: approval.orgId, operationId: approval.operationId },
+      result.funding,
+    );
     if (result.status === "executed") {
       store.payeeHistory.set(approval.payeeId, (store.payeeHistory.get(approval.payeeId) ?? 0) + 1);
       store.settledTodayCents.set(
@@ -563,6 +595,13 @@ async function handle(
       ...("reason" in outcome ? { note: outcome.reason } : {}),
     };
     store.agentTasks.set(task.id, updated);
+
+    // Keep the funding handle when the payout did not fully resolve.
+    recordFunding(
+      store,
+      { orgId: task.orgId, operationId: task.id },
+      "funding" in outcome ? outcome.funding : undefined,
+    );
 
     if (outcome.status === "paid") {
       store.payeeHistory.set(task.payeeId, (store.payeeHistory.get(task.payeeId) ?? 0) + 1);

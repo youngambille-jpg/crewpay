@@ -208,6 +208,12 @@ export interface ExecuteApprovedResult {
   readonly approval: Approval;
   readonly journal?: JournalEntry;
   readonly reasons?: readonly string[];
+  /**
+   * How funding went. Carried on every terminal outcome so the caller can keep
+   * the request id: an unresolved funding request is the one handle needed to
+   * learn later whether the money moved.
+   */
+  readonly funding?: FundingOutcome;
 }
 
 /**
@@ -247,6 +253,7 @@ export async function executeApproved(
       status: "executed",
       approval: { ...approval, status: "executed" },
       journal: result.journal,
+      ...(result.funding ? { funding: result.funding } : {}),
     };
   }
   if (result.kind === "failed") {
@@ -258,7 +265,12 @@ export async function executeApproved(
         ...(result.funding && result.funding.kind === "failed" ? { note: result.funding.reason } : {}),
         ...(result.settlement?.failureReason ? { note: result.settlement.failureReason } : {}),
       },
+      ...(result.funding ? { funding: result.funding } : {}),
     };
   }
-  return { status: "needs_review", approval: { ...approval, status: "executing" } };
+  return {
+    status: "needs_review",
+    approval: { ...approval, status: "executing" },
+    ...(result.funding ? { funding: result.funding } : {}),
+  };
 }

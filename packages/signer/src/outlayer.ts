@@ -13,6 +13,7 @@ import {
   type CustodyPolicy,
   type FundingOutcome,
   type FundingPlan,
+  type FundingRequestState,
   type Signer,
   type SignerWallet,
 } from "./signer.ts";
@@ -147,6 +148,29 @@ export class OutLayerSigner implements Signer {
     return this.interpret(operation, plan, settled);
   }
 
+  /**
+   * Read the service's own row for a funding request and report it plainly.
+   *
+   * This is the reconciliation path for an operation whose funding outcome was
+   * `needs_review` or a not-safe-to-retry failure: the outcome we recorded was
+   * a snapshot, and the row is the truth now. It deliberately does not submit
+   * anything — the whole point is to observe without moving money again.
+   */
+  async reconcile(requestId: string): Promise<FundingRequestState> {
+    const row = await this.client.getRequest(requestId);
+    const status = String(row.status);
+    const result = (row.result ?? {}) as Record<string, unknown>;
+    const tx = result["destination_tx_hash"] ?? result["tx_hash"];
+    const reason = result["reason"];
+    return {
+      requestId,
+      status,
+      terminal: isTerminalStatus(status),
+      ...(typeof reason === "string" ? { reason } : {}),
+      ...(typeof tx === "string" && tx ? { txHash: tx } : {}),
+    };
+  }
+
   private dispatch(plan: FundingPlan, quote: Quote, key: string): Promise<OutLayerRequestRow> {
     const memo = plan.memo ?? quote.depositMemo;
     if (plan.route === "intents") {
@@ -205,15 +229,26 @@ export class OutLayerSigner implements Signer {
         kind: "failed",
         reason: reason ?? "funding failed",
         safeToRetry: neverExecuted,
+        ...(id ? { requestId: id } : {}),
       };
     }
 
     if (status === "rejected") {
-      return { kind: "failed", reason: reason ?? "approvers rejected the funding request", safeToRetry: true };
+      return {
+        kind: "failed",
+        reason: reason ?? "approvers rejected the funding request",
+        safeToRetry: true,
+        ...(id ? { requestId: id } : {}),
+      };
     }
 
     if (status === "refunded") {
-      return { kind: "failed", reason: reason ?? "funding was refunded", safeToRetry: true };
+      return {
+        kind: "failed",
+        reason: reason ?? "funding was refunded",
+        safeToRetry: true,
+        ...(id ? { requestId: id } : {}),
+      };
     }
 
     if (status === "pending_approval" || status === "approved") {

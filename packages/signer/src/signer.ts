@@ -28,6 +28,22 @@ export interface SignerWallet {
 }
 
 /**
+ * The true state of one funding request, read back from the custody service.
+ * This is the reconciliation view: the outcome a caller got at submit time can
+ * be stale, and the service's own row is what a human should act on.
+ */
+export interface FundingRequestState {
+  readonly requestId: string;
+  readonly status: string;
+  /** True once the request can no longer change. */
+  readonly terminal: boolean;
+  /** The service's reason, when it gave one (e.g. a bridge or refund reason). */
+  readonly reason?: string;
+  /** The real chain transaction, once there is one. */
+  readonly txHash?: string;
+}
+
+/**
  * The result of funding one deposit. Funding is not a boolean: a withdrawal can
  * be in flight, fail cleanly, fail with the funds in an unknown state, or need
  * a human. The caller must be able to tell those apart, because the wrong
@@ -36,7 +52,18 @@ export interface SignerWallet {
 export type FundingOutcome =
   | { readonly kind: "deposited"; readonly proof: DepositProof }
   | { readonly kind: "pending"; readonly reason: string; readonly requestId?: string }
-  | { readonly kind: "failed"; readonly reason: string; readonly safeToRetry: boolean }
+  | {
+      readonly kind: "failed";
+      readonly reason: string;
+      readonly safeToRetry: boolean;
+      /**
+       * The custody service's handle for this request. Carried even on failure:
+       * when `safeToRetry` is false the funds may have moved, and the only way
+       * to learn the true state is to re-read this id. Dropping it here would
+       * leave the caller unable to reconcile exactly the case that needs it.
+       */
+      readonly requestId?: string;
+    }
   | { readonly kind: "needs_review"; readonly reason: string; readonly requestId?: string };
 
 export class SignerError extends Error {
@@ -89,5 +116,12 @@ export interface Signer {
   /** Decide, without side effects, how this operation's deposit will be funded. */
   plan(operation: Operation, quote: Quote): FundingPlan;
   fund(operation: Operation, quote: Quote, plan: FundingPlan): Promise<FundingOutcome>;
+  /**
+   * Read the custody service's own row for a funding request. Optional: a
+   * funding-only signer may not expose it. This is read-only on purpose —
+   * reconciliation observes, it never re-submits, because a second submit of a
+   * request whose funds may already have moved is how a payment is sent twice.
+   */
+  readonly reconcile?: (requestId: string) => Promise<FundingRequestState>;
   readonly custody?: CustodyPolicy;
 }

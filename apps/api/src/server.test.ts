@@ -950,3 +950,88 @@ test("the ledger export refuses to report unbalanced books", async () => {
     started.server.close();
   }
 });
+
+// --- Funding reconciliation: unresolved requests keep their handle ----------
+
+test("an unresolved funding is kept as a request we can re-read", async () => {
+  // A pay run whose funding state is unknown must not lose the request id:
+  // without it there is no way to learn whether the money moved.
+  const signer = new FakeSigner({ needsReviewOperationIds: ["run_1_op_1"] });
+  const started = await start({ signer });
+  try {
+    await seedAndRun(started.call, { usdCents: 150_000 });
+    const list = await started.call("/v1/custody/requests?orgId=org_1", "GET");
+    const rows = list.json as unknown as Record<string, unknown>[];
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]!["requestId"], "req_run_1_op_1");
+    assert.equal(rows[0]!["kind"], "needs_review");
+  } finally {
+    started.server.close();
+  }
+});
+
+test("a failure that is not safe to retry is kept; a safe one is not", async () => {
+  // The distinction is the whole point: a retryable failure has no open
+  // question, a non-retryable one may have moved funds.
+  const unsafe = await start({ signer: new FakeSigner({ unsafeFailureOperationIds: ["run_1_op_1"] }) });
+  try {
+    await seedAndRun(unsafe.call, { usdCents: 150_000 });
+    const rows = (await unsafe.call("/v1/custody/requests", "GET")).json as unknown as Record<string, unknown>[];
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]!["safeToRetry"], false);
+  } finally {
+    unsafe.server.close();
+  }
+
+  const safe = await start({ signer: new FakeSigner({ retryableFailureOperationIds: ["run_1_op_1"] }) });
+  try {
+    await seedAndRun(safe.call, { usdCents: 150_000 });
+    const rows = (await safe.call("/v1/custody/requests", "GET")).json as unknown as unknown[];
+    assert.equal(rows.length, 0, "a retryable failure leaves no open question");
+  } finally {
+    safe.server.close();
+  }
+});
+
+test("a settled run leaves no unresolved funding", async () => {
+  const started = await start({ signer: new FakeSigner() });
+  try {
+    await seedAndRun(started.call, { usdCents: 150_000 });
+    const rows = (await started.call("/v1/custody/requests", "GET")).json as unknown as unknown[];
+    assert.equal(rows.length, 0);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("re-reading an unresolved request reports the service's own row", async () => {
+  const signer = new FakeSigner({
+    needsReviewOperationIds: ["run_1_op_1"],
+    // We recorded `needs_review`, but the service now says it succeeded.
+    requestStates: { req_run_1_op_1: { status: "success", txHash: "0xdelivered" } },
+  });
+  const started = await start({ signer });
+  try {
+    await seedAndRun(started.call, { usdCents: 150_000 });
+    const res = await started.call("/v1/custody/requests/req_run_1_op_1", "GET");
+    assert.equal(res.status, 200);
+    const record = res.json["record"] as Record<string, unknown>;
+    const state = res.json["state"] as Record<string, unknown>;
+    assert.equal(record["kind"], "needs_review");
+    assert.equal(state["status"], "success");
+    assert.equal(state["terminal"], true);
+    assert.equal(state["txHash"], "0xdelivered");
+  } finally {
+    started.server.close();
+  }
+});
+
+test("re-reading an unknown request is a 404, not an invented row", async () => {
+  const started = await start({ signer: new FakeSigner() });
+  try {
+    const res = await started.call("/v1/custody/requests/req_nope", "GET");
+    assert.equal(res.status, 404);
+  } finally {
+    started.server.close();
+  }
+});

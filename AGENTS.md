@@ -339,6 +339,25 @@ suite must stay offline and deterministic. Run it by hand or on a schedule.
   rather than report figures it cannot vouch for. The trial balance nets per
   currency, which is the check that catches a torn or truncated ledger.
 
+- **The funding handle was dropped exactly when it was needed.** `interpret()`
+  computed the custody request id and carried it on `needs_review` and
+  `pending`, but returned it on none of the `failed` branches. A failure that is
+  *not* safe to retry means funds may have moved — and that is the one case
+  where re-reading the request is the only way to learn the truth. The id is now
+  carried on every outcome, kept in `store.fundingRequests`, and readable
+  through `/v1/custody/requests`. Only unresolved outcomes are kept: a
+  `deposited` or a safe-to-retry failure has no open question.
+- **The 1Click webhook is not built, on purpose.** OutLayer names
+  `X-Webhook-Signature` and says "HMAC-signed", but no source states what bytes
+  are signed or which secret signs them. Only the separate *Inbox* webhook
+  documents a scheme (HMAC-SHA256 of the body in hex, secret from
+  `PUT /inbox/webhook`); the policy `webhook_url` that carries
+  `request_completed` exposes no secret at all. A receiver that guesses the
+  signed string, or skips verification because the scheme is unclear, accepts a
+  forged "settled" event. Reconciliation is pull-based instead, over the
+  documented `GET /wallet/v1/requests/{id}`. Add the webhook when the contract
+  is confirmed.
+
 ## Status
 
 Done and tested: `domain`, `policy`, `ledger`, `rails` (incl. 1Click adapter,

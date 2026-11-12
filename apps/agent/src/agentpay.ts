@@ -30,9 +30,20 @@ export type AgentTaskOutcome =
     }
   | { readonly status: "denied"; readonly decision: DecisionResult }
   | { readonly status: "awaiting_approval"; readonly decision: DecisionResult }
-  | { readonly status: "failed"; readonly reason: string; readonly decision?: DecisionResult }
+  | {
+      readonly status: "failed";
+      readonly reason: string;
+      readonly decision?: DecisionResult;
+      /** Carried so the caller keeps the request id for reconciliation. */
+      readonly funding?: FundingOutcome;
+    }
   /** Money may have moved and the state is not knowable from here. */
-  | { readonly status: "needs_review"; readonly reason: string; readonly decision?: DecisionResult };
+  | {
+      readonly status: "needs_review";
+      readonly reason: string;
+      readonly decision?: DecisionResult;
+      readonly funding?: FundingOutcome;
+    };
 
 /**
  * Pay an agent for one completed task.
@@ -86,10 +97,10 @@ export async function payAgentTask(
     const plan = deps.signer.plan(operation, signerQuote);
     const outcome = await deps.signer.fund(operation, signerQuote, plan);
     if (outcome.kind === "needs_review" || outcome.kind === "pending") {
-      return { status: "needs_review", reason: outcome.reason, decision };
+      return { status: "needs_review", reason: outcome.reason, decision, funding: outcome };
     }
     if (outcome.kind === "failed") {
-      return { status: "failed", reason: outcome.reason, decision };
+      return { status: "failed", reason: outcome.reason, decision, funding: outcome };
     }
     funding = outcome;
   }

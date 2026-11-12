@@ -190,6 +190,8 @@ POST   /v1/approvals/:id/reject        reject
 POST   /v1/approvals/:id/execute       pay an approved operation (re-checks policy)
 GET    /v1/manifest                    compile the policy to an OutLayer manifest + drift
 GET    /v1/custody/approvals           mirror the wallet's own multisig inbox
+GET    /v1/custody/requests            unresolved funding requests (?orgId=)
+GET    /v1/custody/requests/:id        re-read one request's true state (read-only)
 POST   /v1/invoices                    issue an invoice (PingPay checkout)
 GET    /v1/invoices                    invoices (?orgId=)
 POST   /v1/webhooks/pingpay            payment settled -> trigger pay run / reconcile
@@ -199,8 +201,30 @@ GET    /v1/exports/agent-payments      1099-style roll-up by payee (?orgId=&year
 GET    /v1/ledger                      journal entries + trial balance + attestation (?orgId=)
 ```
 
-Planned but not yet implemented: `POST /v1/webhooks/1click` (swap status
-transitions).
+### Not built: `POST /v1/webhooks/1click`
+
+The roadmap called for an OutLayer `request_completed` webhook receiver. It is
+deliberately not built, because the contract is not specified enough to build
+safely.
+
+The docs name the header (`X-Webhook-Signature`) and say it is HMAC-signed, but
+never say **what bytes are signed, or which secret signs them**. Only the
+*Inbox* webhook (a different surface, for task events) documents a scheme: the
+HMAC-SHA256 of the body in hex, with a secret returned once by `PUT
+/inbox/webhook`. The policy `webhook_url` that carries `request_completed`
+exposes no secret in its schema at all.
+
+Guessing here is not a small risk. A receiver that verifies against the wrong
+string, or skips verification because the scheme is unclear, accepts a forged
+"settled" event and releases money that never arrived. That is the exact failure
+the PingPay webhook was written to avoid — and there the contract *was* clear.
+
+So the reconciliation work went the safe way instead: `/v1/custody/requests`
+keeps every unresolved funding request, and `/v1/custody/requests/:id` re-reads
+the service's own row. That is pull-based, uses the documented `GET
+/wallet/v1/requests/{id}`, and needs no assumption about a signature. A webhook
+is an optimisation on top of this — it can be added once the signing contract is
+confirmed, without changing the reconciliation model.
 
 ## Design rules
 
@@ -239,3 +263,11 @@ transitions).
     the pay run and agent paths and then dropped, so there was nothing to
     export. The endpoint refuses (500) rather than report books containing an
     unbalanced entry.
+11. Funding reconciliation: an unresolved funding request keeps its handle, so
+    the true state can be re-read — done (`/v1/custody/requests`). This closed a
+    real bug: `interpret()` computed the request id but dropped it on every
+    `failed` branch, losing the handle in exactly the case where funds may have
+    moved. The re-read is read-only on purpose; it never re-submits.
+12. OutLayer `request_completed` webhook — see "Not built" above: the signing
+    contract is underspecified, so this waits on confirmation rather than a
+    guess.

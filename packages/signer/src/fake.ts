@@ -1,6 +1,7 @@
 import type { Operation } from "@crewpay/domain";
 import type { Quote } from "@crewpay/rails";
-import type { CustodyPolicy, FundingOutcome, FundingPlan, Signer, SignerWallet } from "./signer.ts";
+import { isTerminalStatus } from "./outlayer-client.ts";
+import type { CustodyPolicy, FundingOutcome, FundingPlan, FundingRequestState, Signer, SignerWallet } from "./signer.ts";
 
 export interface FakeSignerOptions {
   /** Operations that fund successfully but report no tx identifier. */
@@ -18,6 +19,12 @@ export interface FakeSignerOptions {
   readonly effectivePolicy?: Record<string, unknown>;
   /** Multisig approvals the wallet is waiting on. */
   readonly openApprovals?: readonly { approvalId: string; requestId?: string; status?: string }[];
+  /**
+   * The service row `reconcile` should report, per request id. Absent ids
+   * resolve to a terminal `success` so a test only has to state the interesting
+   * cases.
+   */
+  readonly requestStates?: Readonly<Record<string, { status: string; reason?: string; txHash?: string }>>;
 }
 
 /**
@@ -65,10 +72,20 @@ export class FakeSigner implements Signer {
       return { kind: "pending", reason: "injected stall", requestId: `req_${id}` };
     }
     if (this.cfg.retryableFailureOperationIds?.includes(id)) {
-      return { kind: "failed", reason: "injected transient failure", safeToRetry: true };
+      return {
+        kind: "failed",
+        reason: "injected transient failure",
+        safeToRetry: true,
+        requestId: `req_${id}`,
+      };
     }
     if (this.cfg.unsafeFailureOperationIds?.includes(id)) {
-      return { kind: "failed", reason: "injected bridge failure", safeToRetry: false };
+      return {
+        kind: "failed",
+        reason: "injected bridge failure",
+        safeToRetry: false,
+        requestId: `req_${id}`,
+      };
     }
     if (this.cfg.unprovableOperationIds?.includes(id)) {
       return { kind: "needs_review", reason: "funding succeeded but no tx identifier was returned" };
@@ -89,4 +106,16 @@ export class FakeSigner implements Signer {
     effectivePolicy: async () => this.cfg.effectivePolicy ?? {},
     openApprovals: async () => this.cfg.openApprovals ?? [],
   };
+
+  /** Read back a request's state. Defaults to a terminal success. */
+  async reconcile(requestId: string): Promise<FundingRequestState> {
+    const row = this.cfg.requestStates?.[requestId] ?? { status: "success" };
+    return {
+      requestId,
+      status: row.status,
+      terminal: isTerminalStatus(row.status),
+      ...(row.reason ? { reason: row.reason } : {}),
+      ...(row.txHash ? { txHash: row.txHash } : {}),
+    };
+  }
 }

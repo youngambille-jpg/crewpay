@@ -278,3 +278,71 @@ test("pending_approvals accepts both a bare array and an approvals wrapper", asy
   });
   assert.deepEqual(await signer.custody.openApprovals(), [{ approvalId: "apv_2" }]);
 });
+
+test("a failed funding carries its request id, so the state can be re-read", async () => {
+  // The id matters most here: a failure that is NOT safe to retry means funds
+  // may have moved, and the request id is the only handle back to the truth.
+  const { fn } = mockFetch([
+    { body: { request_id: "r_bridge", status: "failed", result: { reason: "bridge timed out" } } },
+  ]);
+  const s = signer(fn);
+  const r = await s.fund(op(), quote(), s.plan(op(), quote()));
+  assert.equal(r.kind, "failed");
+  if (r.kind === "failed") {
+    assert.equal(r.safeToRetry, false);
+    assert.equal(r.requestId, "r_bridge", "a not-safe-to-retry failure must keep its handle");
+  }
+});
+
+test("a rejected funding carries its request id", async () => {
+  const { fn } = mockFetch([{ body: { request_id: "r_rej", status: "rejected" } }]);
+  const s = signer(fn);
+  const r = await s.fund(op(), quote(), s.plan(op(), quote()));
+  assert.equal(r.kind, "failed");
+  if (r.kind === "failed") assert.equal(r.requestId, "r_rej");
+});
+
+test("reconcile reads the service row and reports the destination tx on success", async () => {
+  const { fn, calls } = mockFetch([
+    {
+      body: {
+        request_id: "r1",
+        status: "success",
+        result: { destination_tx_hash: "0xreal", transfer_intent_hash: "0xintent" },
+      },
+    },
+  ]);
+  const state = await signer(fn).reconcile("r1");
+  assert.equal(state.status, "success");
+  assert.equal(state.terminal, true);
+  // The real delivery tx, never the intent hash.
+  assert.equal(state.txHash, "0xreal");
+  assert.equal(calls[0]!.method, "GET");
+  assert.ok(calls[0]!.url.endsWith("/wallet/v1/requests/r1"));
+});
+
+test("reconcile reports a non-terminal row as still open", async () => {
+  const { fn } = mockFetch([{ body: { request_id: "r2", status: "processing" } }]);
+  const state = await signer(fn).reconcile("r2");
+  assert.equal(state.terminal, false);
+  assert.equal(state.txHash, undefined);
+});
+
+test("reconcile surfaces the service reason on a failure", async () => {
+  const { fn } = mockFetch([
+    { body: { request_id: "r3", status: "failed", result: { reason: "bridge refunded" } } },
+  ]);
+  const state = await signer(fn).reconcile("r3");
+  assert.equal(state.status, "failed");
+  assert.equal(state.terminal, true);
+  assert.equal(state.reason, "bridge refunded");
+});
+
+test("reconcile never submits: a GET is the only call it makes", async () => {
+  // Reconciliation must observe, never act. A POST here would risk re-sending a
+  // request whose funds may already have moved.
+  const { fn, calls } = mockFetch([{ body: { request_id: "r4", status: "processing" } }]);
+  await signer(fn).reconcile("r4");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.method, "GET");
+});
