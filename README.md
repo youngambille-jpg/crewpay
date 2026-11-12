@@ -207,17 +207,31 @@ The roadmap called for an OutLayer `request_completed` webhook receiver. It is
 deliberately not built, because the contract is not specified enough to build
 safely.
 
-The docs name the header (`X-Webhook-Signature`) and say it is HMAC-signed, but
-never say **what bytes are signed, or which secret signs them**. Only the
-*Inbox* webhook (a different surface, for task events) documents a scheme: the
-HMAC-SHA256 of the body in hex, with a secret returned once by `PUT
-/inbox/webhook`. The policy `webhook_url` that carries `request_completed`
-exposes no secret in its schema at all.
+The docs name the `request_completed` event but never state **what signs it or
+which secret is used**. This was re-verified by sweeping all 27 OutLayer doc
+pages (`/docs/*`, from the sitemap):
+
+- `X-Webhook-Signature` appears on exactly one page, the **tasks** doc — and it
+  is a *different* webhook: the owner names an HTTPS URL on the inbox settings,
+  and each request carries `X-Wallet-Id: owner:<account>` plus
+  `X-Webhook-Signature`, "the HMAC-SHA256 of the body in hex under a secret made
+  when the URL was named and shown to the owner once". That scheme is real and
+  implementable, but it fires `task_created` / `task_answered` / `task_failed` /
+  `task_expired` — task lifecycle, not wallet funding.
+- The wallet `request_completed` event is mentioned once (agent-custody) with no
+  scheme, no secret and no field to name a URL. `webhook_url` appears on no page
+  at all.
+- `X-Binding-Webhook-Secret` exists but runs the other way (partner → OutLayer
+  lifecycle news), not OutLayer → us.
 
 Guessing here is not a small risk. A receiver that verifies against the wrong
 string, or skips verification because the scheme is unclear, accepts a forged
 "settled" event and releases money that never arrived. That is the exact failure
 the PingPay webhook was written to avoid — and there the contract *was* clear.
+
+Worth noting the layer below agrees: the 1Click docs (NEAR Intents) document no
+webhook either — swap status is tracked with `GET /v0/status`. Polling is the
+documented path at both levels.
 
 So the reconciliation work went the safe way instead: `/v1/custody/requests`
 keeps every unresolved funding request, and `/v1/custody/requests/:id` re-reads

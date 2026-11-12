@@ -186,6 +186,25 @@ or `testnet.api.`, which do not resolve. NEAR Intents do not exist on testnet.
   `compileManifest` warns above that (`MAX_APPROVERS`).
 - `pending_approval` is "not an error"; `needs_review` means fund state is
   UNKNOWN and must not be retried; `rejected` is a terminal failure.
+- **Exact status strings, verified 2026-11-12** against
+  `https://app.outlayer.ai/docs/agent-custody`. The withdraw/swap row from
+  `GET /wallet/v1/requests/{id}` holds only: `processing` (keep polling),
+  `success`, `failed` (a 1Click refund/expiry is *normalized to* `failed`; the
+  detail is in `result.reason`), and `needs_review`. A multisig wallet's submit
+  may instead return `pending_approval` / `approved` / `rejected`. The docs say
+  outright: "Do not invent synonym sets (`settled`/`completed`/…) — none of those
+  are emitted." `OutLayerStatus` in `outlayer-client.ts` mirrors this; do not
+  widen it. `needs_review` is terminal but special — execution was interrupted
+  and the fund state is unknown, so surface it, never auto-retry.
+- **A multisig revert surfaces late.** If execution reverts on-chain after the
+  threshold is met, it appears as `status: "failed"` via
+  `GET /wallet/v1/requests/{id}` — not as a synchronous 422. A synchronous 422
+  with `error: onchain_tx_failed` (plus the real `tx_hash`) means the tx *is* on
+  chain, so do not retry it.
+- **The wallet `request_completed` webhook has no documented signing scheme.**
+  Verified by sweeping all 27 `/docs/*` pages: `X-Webhook-Signature` appears only
+  on the *tasks* doc and signs the inbox **task** webhook, not wallet funding.
+  Do not implement a receiver for it on a guess — see README "Not built".
 
 ## PingPay notes (read from the docs, not guessed)
 
@@ -347,12 +366,15 @@ suite must stay offline and deterministic. Run it by hand or on a schedule.
   carried on every outcome, kept in `store.fundingRequests`, and readable
   through `/v1/custody/requests`. Only unresolved outcomes are kept: a
   `deposited` or a safe-to-retry failure has no open question.
-- **The 1Click webhook is not built, on purpose.** OutLayer names
-  `X-Webhook-Signature` and says "HMAC-signed", but no source states what bytes
-  are signed or which secret signs them. Only the separate *Inbox* webhook
-  documents a scheme (HMAC-SHA256 of the body in hex, secret from
-  `PUT /inbox/webhook`); the policy `webhook_url` that carries
-  `request_completed` exposes no secret at all. A receiver that guesses the
+- **The 1Click webhook is not built, on purpose.** OutLayer names the
+  `request_completed` event but never states what signs it or which secret is
+  used. Sweeping all 27 `/docs/*` pages: `X-Webhook-Signature` appears on exactly
+  one — the *tasks* doc — where it signs the **inbox task** webhook
+  (`task_created`/`task_answered`/`task_failed`/`task_expired`), a different
+  surface; the wallet funding event is mentioned once with no scheme and no URL
+  field (`webhook_url` appears on no page); `X-Binding-Webhook-Secret` runs the
+  opposite way (partner → OutLayer). The layer below agrees — the 1Click docs
+  document no webhook either, only `GET /v0/status`. A receiver that guesses the
   signed string, or skips verification because the scheme is unclear, accepts a
   forged "settled" event. Reconciliation is pull-based instead, over the
   documented `GET /wallet/v1/requests/{id}`. Add the webhook when the contract
