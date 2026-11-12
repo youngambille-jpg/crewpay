@@ -19,7 +19,7 @@
 import type { Operation } from "@crewpay/domain";
 import { corridor } from "@crewpay/domain";
 import { AssetRegistry, OneClickRail, AgentPayClient, KNOWN_TOKENS, PingPayClient } from "@crewpay/rails";
-import type { Quote } from "@crewpay/rails";
+import type { Quote, X402Accept } from "@crewpay/rails";
 import { OutLayerSigner } from "@crewpay/signer";
 
 const ONECLICK_URL = process.env["ONECLICK_BASE_URL"] ?? "https://1click.chaindefuser.com";
@@ -31,6 +31,11 @@ const OUTLAYER_TESTNET = process.env["OUTLAYER_TESTNET_URL"] ?? "https://testnet
  */
 const PING_API_KEY = process.env["PING_API_KEY"];
 const TIMEOUT_MS = 30_000;
+
+// The org's receive asset is wNEAR, which has 24 decimals. A round-looking
+// 200000 is dust at that scale, and 1Click answers "No liquidity available" —
+// not a config bug, just an unquotable size. Default to 1 wNEAR, overridable.
+const SMOKE_AMOUNT_OUT = BigInt(process.env["SMOKE_AMOUNT_OUT"] ?? "1000000000000000000000000");
 
 const BASE_USDC = { chain: "base", asset: "usdc" } as const;
 const NEAR_USDC = { chain: "near", asset: "usdc" } as const;
@@ -195,7 +200,7 @@ async function checkPingX402(): Promise<void> {
     // `/offers` is auth-gated: a 401 here is the expected, correct answer and
     // confirms we are sending the request to the right place with the wrong key.
     try {
-      await client.offers({ amountOut: 200_000n, description: "crewpay-smoke" });
+      await client.offers({ amountOut: SMOKE_AMOUNT_OUT, description: "crewpay-smoke" });
       console.log("       note: /offers accepted a placeholder key; a real key may be unnecessary");
     } catch (e) {
       const msg = (e as Error).message;
@@ -346,8 +351,9 @@ async function checkPingPayAuthed(): Promise<void> {
   //    the org. `agent_pay_misconfigured` proves auth passed and the request
   //    shape was understood.
   const agent = new AgentPayClient({ baseUrl: PING_URL, apiKey: PING_API_KEY, refundTo: "crewpay.near", fetchImpl: f });
+  let offers: { accepts: readonly X402Accept[] } | undefined;
   try {
-    const offers = await agent.offers({ amountOut: 200_000n, description: "crewpay-smoke" });
+    offers = await agent.offers({ amountOut: SMOKE_AMOUNT_OUT, description: "crewpay-smoke" });
     pass("POST /agentpay/x402/offers", `${offers.accepts.length} origin assets offered (org configured)`);
   } catch (e) {
     const code = (e as { code?: string }).code;
@@ -360,8 +366,48 @@ async function checkPingPayAuthed(): Promise<void> {
       fail("POST /agentpay/x402/offers", `unexpected: ${(e as Error).message}`);
     }
   }
+  // 3. Opt-in: mint a real quote. `verify` returns a deposit address but moves
+  //    no money, and an unfunded quote simply expires — so this is safe, but it
+  //    is gated anyway because it creates state on a live mainnet org.
+  //
+  //    `refundTo` must be an address on the *selected origin chain*: a NEAR
+  //    origin needs a NEAR account, an EVM origin needs an EVM address. Ping
+  //    refuses the quote outright when the chain does not match.
+  if (process.env["SMOKE_ALLOW_QUOTE"] === "1" && offers) {
+    const nearUsdc = offerFor(offers.accepts, "near:mainnet", "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1");
+    if (!nearUsdc) {
+      warn("POST /agentpay/x402/verify", "no NEAR-USDC origin offer to quote");
+    } else {
+      const refundTo = process.env["SMOKE_REFUND_NEAR"] ?? "crewpay.near";
+      try {
+        const q = await agent.quote({ offer: nearUsdc, refundTo });
+        if (!q.depositAddress || !q.operationToken) {
+          fail("POST /agentpay/x402/verify", "quote returned without depositAddress/operationToken");
+        } else {
+          pass(
+            "POST /agentpay/x402/verify",
+            `quote minted: depositAddress ${q.depositAddress.slice(0, 12)}… amountIn=${q.amountIn} refundTo=${refundTo}`,
+          );
+        }
+      } catch (e) {
+        fail("POST /agentpay/x402/verify", `${(e as Error).message} (code=${(e as { code?: string }).code})`);
+      }
+    }
+  } else {
+    warn("POST /agentpay/x402/verify", "skipped; set SMOKE_ALLOW_QUOTE=1 to mint a real quote");
+  }
 }
 
+/** Pick the offer for one origin network and asset, by CAIP-19 id substring. */
+function offerFor(
+  accepts: readonly { network: string; asset: string }[],
+  network: string,
+  assetIdFragment: string,
+): X402Accept | undefined {
+  return accepts.find((a) => a.network === network && a.asset.includes(assetIdFragment)) as
+    | X402Accept
+    | undefined;
+}
 console.log(
   `CrewPay live smoke test\n  1Click:  ${ONECLICK_URL}\n  Ping:    ${PING_URL}\n  OutLayer: ${OUTLAYER_TESTNET}`,
 );

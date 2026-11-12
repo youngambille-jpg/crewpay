@@ -191,11 +191,12 @@ export class AgentPayClient implements AgentPayPort {
       },
     });
     if (status < 200 || status >= 300 || json["isValid"] !== true) {
-      throw new AgentPayError(
-        status,
-        String(json["code"] ?? json["errorReason"] ?? "quote_failed"),
-        "quote was not minted",
-      );
+      // The live verify response reports the cause in `invalidReason` with a
+      // human detail in `invalidMessage`. Settle uses `errorReason` instead, and
+      // the docs only document the *codes*, not the field, so read all three.
+      const code = String(json["invalidReason"] ?? json["code"] ?? json["errorReason"] ?? "quote_failed");
+      const detail = typeof json["invalidMessage"] === "string" ? json["invalidMessage"] : "";
+      throw new AgentPayError(status, code, detail ? `quote was not minted: ${detail}` : "quote was not minted");
     }
     const extra = (json["extra"] ?? {}) as Record<string, unknown>;
     const depositAddress = extra["depositAddress"];

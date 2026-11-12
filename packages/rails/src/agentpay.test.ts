@@ -119,6 +119,26 @@ test("quote() surfaces a Ping refusal with its code", async () => {
   );
 });
 
+test("quote() reads the live verify error fields, not just the documented code", async () => {
+  // Observed wire shape: the cause is in `invalidReason`, the detail in
+  // `invalidMessage`. A client that reads only `errorReason`/`code` reports a
+  // generic failure and hides the one string that says what to fix.
+  const { fetchImpl } = recorder({
+    status: 400,
+    body: {
+      isValid: false,
+      invalidReason: "invalid_exact_near_intents_quote_unavailable",
+      invalidMessage: "No liquidity available",
+    },
+  });
+  await assert.rejects(
+    () => client(fetchImpl).quote({ offer: OFFER }),
+    (e: unknown) =>
+      (e as { code?: string }).code === "invalid_exact_near_intents_quote_unavailable" &&
+      /No liquidity available/.test((e as Error).message),
+  );
+});
+
 test("quote() rejects a malformed 200 that omits the deposit fields", async () => {
   const { fetchImpl } = recorder({ status: 200, body: { isValid: true, extra: { depositAddress: "0xdep" } } });
   await assert.rejects(() => client(fetchImpl).quote({ offer: OFFER }), /omitted depositAddress or operationToken/);

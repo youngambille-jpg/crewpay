@@ -280,19 +280,35 @@ suite must stay offline and deterministic. Run it by hand or on a schedule.
   `x-api-key` (which carries the `pk_` value). Our client sent the wrong one and
   every fixture test passed anyway, because the mock accepted any header. Fixed;
   this is the single best argument for the smoke test existing.
-- **A valid PingPay key still cannot complete a run until the org is
-  configured.** `GET /api/agentpay/registration` is the only place the
-  *specific* blocking reason appears, so the smoke test reports it verbatim.
-  Observed states, in order: `{enabled:false, valid:false,
-  recipientConfigured:false}` → then `{enabled:true, valid:false,
-  recipientConfigured:true, error:"Your Intents balance uses the NEAR account
-  saved under Recipient Addresses. Add that account before agents can pay."}`.
-  So `recipientConfigured` gates the checkout route and the *balance-backed*
-  NEAR account gates the facilitator — two different checks. Nothing is
-  settable over the API (`/api/settings`, `/api/org`, `/api/account`, `/api/me`,
+- **x402 quote works end-to-end live.** `POST /agentpay/x402/verify` with
+  `{type:"quote"}` returns `{isValid:true, extra:{depositAddress,
+  operationToken, amountIn, refundTo, refundType, refundDeadline}}`, and
+  `AgentPayClient.quote()` parses it. `depositAddress` is a 32-byte hex string
+  (a NEAR implicit account, not a `0x` address). Unfunded quotes simply expire —
+  no money moves at quote time.
+- **The quote error field is `invalidReason`/`invalidMessage`, not
+  `errorReason`/`code`.** We read the latter, so every live refusal was reported
+  as a generic `quote_failed` and the actual cause was invisible. Now reads all
+  three (`invalidReason` → `code` → `errorReason`) and appends the message. Docs
+  list the error *codes* but never name the field, so only the wire showed this.
+- **`refundTo` must be an address on the selected origin chain.** A NEAR origin
+  needs a NEAR account; an EVM origin needs an EVM address. Ping fails closed
+  (`invalid_exact_near_intents_quote_unavailable`) when they do not match, and
+  does **not** fall back to dashboard metadata.
+- **The receive asset's decimals matter for the amount.** The configured
+  receive asset is `wrap.near` (24 decimals), so `amountOut:"200000"` is dust and
+  1Click answers "No liquidity available" — which reads like an outage but is
+  really an unquotable size. `amountOut:"1000000000000000000000000"` (1 wNEAR)
+  quotes fine. Check decimals before blaming the provider.
+- **`GET /agentpay/registration` is the only place the specific blocker
+  appears**, so the smoke test reports it verbatim. Observed states, in order:
+  `{enabled:false, valid:false, recipientConfigured:false}` → `{enabled:true,
+  valid:false, recipientConfigured:true, error:"…Intents balance uses the NEAR
+  account saved under Recipient Addresses…"}` → `{enabled:true, valid:true,
+  recipientConfigured:true}`. `recipientConfigured` gates the checkout route;
+  the balance-backed NEAR account gates the facilitator. Nothing is settable
+  over the API (`/api/settings`, `/api/org`, `/api/account`, `/api/me`,
   `/api/config` all 404); it is dashboard state.
-  `GET /api/checkout/sessions/{id}` with no key returns 404, not 401 — the
-  session id space is not an auth oracle.
 - **x402 request shapes match the docs field-for-field.** `verify` body is
   `{x402Version:2, paymentPayload:{payload:{type:"quote",refundTo}}, paymentRequirements:offer}`;
   `settle` adds `operationToken`, `depositAddress`, `txHash` (and `depositMemo`
