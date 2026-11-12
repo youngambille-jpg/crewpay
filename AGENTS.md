@@ -24,8 +24,10 @@ There is no build step. There are no runtime dependencies in the core packages.
 - **Node >= 22.6 runs `.ts` directly** via native type stripping. We rely on
   this: sources import each other with explicit `.ts` extensions and nothing is
   compiled. Do not add a bundler or ts-node.
-- **Type stripping does not allow enum or namespace.** Use string-literal union
-  types and plain objects (`as const`) instead.
+- **Strip-only mode forbids enum, namespace, and constructor parameter
+  properties.** Use string-literal union types, `as const` objects, and assign
+  fields explicitly in the constructor body. `tsc` will not catch this; the
+  test runner will.
 - **`node --test` with no path arguments** discovers `*.test.ts`. Passing a
   directory path fails with MODULE_NOT_FOUND; pass a file path instead.
 - **Workspace packages need an `exports` map** (`{".": "./src/index.ts"}`) or
@@ -62,13 +64,31 @@ There is no build step. There are no runtime dependencies in the core packages.
 - `packages/policy` — pure function `evaluate(op, policy, ctx)`. No I/O.
 - `packages/ledger` — pure journal constructors. No I/O.
 - `packages/rails` — `SettlementRail` interface + adapters (`FakeRail`,
-  `OneClickRail`). Network only here.
+  `OneClickRail`) and `AssetRegistry`. Network only here.
 - `apps/agent` — orchestration (`executeRun`): policy → rail → ledger.
 - `apps/api` — control plane over `node:http`, in-memory store. Owns org state,
   never moves money itself.
 
+## 1Click rail notes
+
+- Spec of record: `https://1click.chaindefuser.com/docs/v0/openapi.yaml`.
+  Adapter is written against it; do not guess field names.
+- Auth header is `X-API-Key`. Base URL is `https://1click.chaindefuser.com`.
+- Quote requires all of: `dry`, `swapType`, `slippageTolerance`, `originAsset`,
+  `depositType`, `destinationAsset`, `amount`, `refundTo`, `refundType`,
+  `recipient`, `recipientType`, `deadline`. `depositType` is easy to forget.
+- Asset ids are not guessable: USDC on NEAR is
+  `nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1`,
+  and 1Click lists native NEAR as symbol `wNEAR`. Resolve through
+  `AssetRegistry`; never hardcode an id at a call site.
+- Run `npm run verify:tokens` after touching `assets.ts`. It checks the pinned
+  table against the live `GET /v0/tokens` and fails on drift.
+- `EXACT_OUTPUT` means `amount` is the destination amount; `amountIn` comes back
+  with a slippage buffer and is refunded if unused.
+
 ## Status
 
-Done and tested: `domain`, `policy`, `ledger`, agent orchestration, api skeleton.
-Not started: live 1Click wiring, OutLayer signing, PingPay, x402/MPP agent
-payouts, Postgres persistence, web UI.
+Done and tested: `domain`, `policy`, `ledger`, `rails` (incl. 1Click adapter),
+agent orchestration, api skeleton. 49 tests.
+Not started: the signer that broadcasts deposits, OutLayer signing, PingPay,
+x402/MPP agent payouts, Postgres persistence, web UI.

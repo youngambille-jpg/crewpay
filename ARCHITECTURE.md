@@ -254,9 +254,15 @@ subject to the same policy engine.
 
 ## 6. Rails mapping
 
+The rail layer is `packages/rails`. Everything rail-specific sits behind the
+`SettlementRail` interface (`quote` → `submit` → `poll`), so money logic never
+imports a vendor. `OneClickRail` is written against the published OpenAPI spec
+at `https://1click.chaindefuser.com/docs/v0/openapi.yaml`.
+
 | Need | Rail | Concrete calls |
 | --- | --- | --- |
-| Cross-chain payout | NEAR Intents 1Click | `POST /v0/quote`, `/v0/status`, `/v0/generate-intent`, `/v0/submit-intent`, `appFees`, `refundTo` |
+| Cross-chain payout | NEAR Intents 1Click | `POST /v0/quote`, `POST /v0/deposit/submit`, `GET /v0/status`, `appFees`, `refundTo` |
+| Asset identity | 1Click | `GET /v0/tokens` → `AssetRegistry` (id + decimals per asset) |
 | Fund without on-chain wait | 1Click Intents | `depositType: INTENTS`, signed intent execution |
 | Privacy for sensitive pay | 1Click confidential | `confidentiality` / `CONFIDENTIAL_INTENTS` |
 | Fiat collection / invoicing | PingPay | hosted checkout, headless payments, subscriptions, onramp, webhooks |
@@ -264,6 +270,30 @@ subject to the same policy engine.
 | Custody, policy, approvals, attestation | OutLayer | TEE wallets, policy manifest, tasks/inbox, payment checks, transparency proofs |
 | Yield on idle treasury | 1Click Earn | Earn endpoints |
 | Screening | SHIELD / provider | incident + screening checks before `allow` |
+
+### What the 1Click adapter actually does
+
+- **`quote`** posts the full required field set (`dry`, `swapType`,
+  `slippageTolerance`, `originAsset`, `depositType`, `destinationAsset`,
+  `amount`, `refundTo`, `refundType`, `recipient`, `recipientType`, `deadline`)
+  with `swapType: EXACT_OUTPUT` so the payee receives exactly the payroll
+  amount. `amount` is the destination amount in base units.
+- **Asset ids come from the service, not from guesswork.** `AssetRegistry`
+  resolves `chain:asset` to a 1Click id and carries decimals. A wrong id sends
+  funds to the wrong asset, so the offline table is pinned and guarded by
+  `npm run verify:tokens`, which checks it against the live `GET /v0/tokens`.
+- **`submit`** calls `POST /v0/deposit/submit` with the deposit tx hash once the
+  signer has broadcast. Without a proof it reports `submitted` and leaves the
+  deposit address live.
+- **`poll`** calls `GET /v0/status` with `depositAddress` (and `depositMemo`
+  when the quote returned one) and maps 1Click's status vocabulary onto the
+  internal one: `KNOWN_DEPOSIT_TX | PENDING_DEPOSIT | INCOMPLETE_DEPOSIT |
+  PROCESSING → pending`, `SUCCESS → settled`, `REFUNDED → refunded`,
+  `FAILED → failed`.
+- **Auth** is the `X-API-Key` header (partner keys); the older JWT flow is not
+  used.
+- **Evidence** for the ledger comes from the status response: destination tx
+  hash, intent hashes and the quote signature.
 
 ## 7. Security model
 

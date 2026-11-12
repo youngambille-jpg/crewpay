@@ -1,7 +1,15 @@
 import type { Operation, PayRunItem, Payee, Policy } from "@crewpay/domain";
 import { type DecisionResult, evaluate, type DecisionContext } from "@crewpay/policy";
 import { paymentSettled, type JournalEntry } from "@crewpay/ledger";
-import type { SettlementRail } from "@crewpay/rails";
+import type { SettlementRail, SettlementStatus } from "@crewpay/rails";
+
+/** How many times to poll a rail before giving up on an in-flight settlement. */
+const MAX_POLLS = 30;
+
+/** States that mean "not finished yet"; the rail should be polled again. */
+function isInFlight(status: SettlementStatus): boolean {
+  return status === "quoted" || status === "submitted" || status === "pending";
+}
 
 export interface OperationOutcome {
   readonly operationId: string;
@@ -73,8 +81,8 @@ export async function executeRun(
 
     const quote = await deps.rail.quote(operation);
     let settlement = await deps.rail.submit(operation, quote);
-    while (settlement.status === "pending") {
-      settlement = await deps.rail.poll(operation.id);
+    for (let attempt = 0; attempt < MAX_POLLS && isInFlight(settlement.status); attempt += 1) {
+      settlement = await deps.rail.poll(operation.id, quote);
     }
 
     if (settlement.status === "settled") {

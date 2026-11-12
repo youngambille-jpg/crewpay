@@ -16,6 +16,7 @@
     "test:policy": "node --test packages/policy/src/engine.test.ts",
     "test:ledger": "node --test packages/ledger/src/journal.test.ts",
     "demo": "node apps/api/src/demo.ts",
+    "verify:tokens": "node scripts/verify-tokens.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

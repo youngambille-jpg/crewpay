@@ -1,117 +1,241 @@
 import type { ChainAsset, Operation } from "@crewpay/domain";
-import type { Quote, SettlementRail, SettlementResult } from "./settlement.ts";
+import type { AssetRegistry } from "./assets.ts";
+import { RailError, type DepositProof, type Quote, type SettlementRail, type SettlementResult, type SettlementStatus } from "./settlement.ts";
 
-const ONE_CLICK_BASE = "https://1click.chaindefuser.com/v0";
-
-/** 1Click uses `nep141:<contract>` for NEAR assets and `nep141:<chain>-<addr>.omft.near` for bridged. */
-const ASSET_IDS: Record<string, string> = {
-  "near:usdc": "nep141:usdc.near",
-  "near:usdt": "nep141:usdt.tether-token.near",
-  "near:near": "nep141:wrap.near",
-  "base:usdc": "nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near",
-  "arbitrum:usdc": "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
-  "eth:usdc": "nep141:eth-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.omft.near",
-  "solana:usdc": "nep141:sol-EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v.omft.near",
-  "eth:eth": "nep141:eth.omft.near",
-  "btc:btc": "nep141:btc.omft.near",
+/** 1Click chain codes as they appear in the `blockchain` field. */
+const CHAIN_ALIASES: Record<string, string> = {
+  ethereum: "eth",
+  arbitrum: "arb",
+  polygon: "pol",
+  solana: "sol",
+  bitcoin: "btc",
 };
 
-export function assetId(ca: ChainAsset): string {
-  const id = ASSET_IDS[`${ca.chain}:${ca.asset}`];
-  if (!id) throw new Error(`no 1Click asset id for ${ca.chain}:${ca.asset}`);
-  return id;
+function chainCode(ca: ChainAsset): string {
+  return CHAIN_ALIASES[ca.chain.toLowerCase()] ?? ca.chain.toLowerCase();
+}
+
+/** 1Click status vocabulary, from `GetExecutionStatusResponse.status`. */
+export type OneClickStatus =
+  | "KNOWN_DEPOSIT_TX"
+  | "PENDING_DEPOSIT"
+  | "INCOMPLETE_DEPOSIT"
+  | "PROCESSING"
+  | "SUCCESS"
+  | "REFUNDED"
+  | "FAILED";
+
+export function mapStatus(status: OneClickStatus | string): SettlementStatus {
+  switch (status) {
+    case "SUCCESS":
+      return "settled";
+    case "REFUNDED":
+      return "refunded";
+    case "FAILED":
+      return "failed";
+    case "KNOWN_DEPOSIT_TX":
+    case "PENDING_DEPOSIT":
+    case "INCOMPLETE_DEPOSIT":
+    case "PROCESSING":
+      return "pending";
+    default:
+      return "pending";
+  }
+}
+
+export interface AppFee {
+  /** Account id inside Intents that receives Crewpay's take-rate. */
+  readonly recipient: string;
+  /** Fee in basis points of `amountIn`. */
+  readonly fee: number;
 }
 
 export interface OneClickConfig {
-  /** JWT or partner API key. Absent means the unauthenticated fee schedule. */
+  /** Partner API key, sent as the `X-API-Key` header. */
   readonly apiKey?: string;
-  /** Basis points Crewpay keeps, collected via `appFees`. */
-  readonly appFeeBps?: number;
-  readonly appFeeRecipient?: string;
+  readonly baseUrl?: string;
+  /** Resolves `chain:asset` to a 1Click asset id. */
+  readonly registry: AssetRegistry;
+  /** Where funds go if the swap cannot complete. */
+  readonly refundTo: string;
+  /**
+   * `ORIGIN_CHAIN` gives a per-chain deposit address the signer funds directly.
+   * `INTENTS` gives a single Intents account, useful when treasury already
+   * holds funds inside Intents.
+   */
+  readonly depositType?: "ORIGIN_CHAIN" | "INTENTS";
+  /** Crewpay's take-rate, collected by 1Click on our behalf. */
+  readonly appFee?: AppFee;
+  readonly slippageBps?: number;
+  /** How far ahead the quote deadline sits, in milliseconds. */
+  readonly deadlineMs?: number;
   readonly fetchImpl?: typeof fetch;
 }
 
+interface QuoteResponseBody {
+  readonly correlationId: string;
+  readonly signature: string;
+  readonly quote: {
+    readonly depositAddress: string;
+    readonly depositMemo?: string;
+    readonly amountIn: string;
+    readonly minAmountIn: string;
+    readonly amountOut: string;
+    readonly minAmountOut: string;
+    readonly withdrawFee?: string;
+    readonly deadline?: string;
+  };
+}
+
+interface StatusBody {
+  readonly correlationId: string;
+  readonly status: string;
+  readonly swapDetails?: {
+    readonly intentHashes?: readonly string[];
+    readonly destinationChainTxHashes?: readonly { hash: string }[];
+    readonly refundReason?: string;
+  };
+}
+
 /**
- * Adapter over the 1Click Swap API. It issues EXACT_OUTPUT quotes so the payee
- * receives exactly the payroll amount, sets `refundTo` so failed swaps are
- * recoverable, and attaches `appFees` to collect Crewpay's take-rate.
+ * Adapter over the 1Click Swap API, written against the published OpenAPI spec
+ * at `https://1click.chaindefuser.com/docs/v0/openapi.yaml`.
  *
- * The transport is injectable so this class can be tested against recorded
- * responses without network access.
+ * It issues `EXACT_OUTPUT` quotes so the payee receives exactly the payroll
+ * amount, sets `refundTo` so a failed swap is recoverable, and attaches
+ * `appFees` to collect Crewpay's take-rate. The transport is injectable so the
+ * whole lifecycle can be tested against recorded responses with no network.
  */
 export class OneClickRail implements SettlementRail {
   readonly name = "1click";
   private readonly cfg: OneClickConfig;
+  private readonly baseUrl: string;
   private readonly fetch: typeof fetch;
+  /** Polling needs the memo, which is not part of the operation. */
+  private readonly memos = new Map<string, string>();
 
-  constructor(cfg: OneClickConfig = {}) {
+  constructor(cfg: OneClickConfig) {
     this.cfg = cfg;
+    this.baseUrl = (cfg.baseUrl ?? "https://1click.chaindefuser.com").replace(/\/$/, "");
     this.fetch = cfg.fetchImpl ?? globalThis.fetch;
   }
 
   private headers(): Record<string, string> {
     const h: Record<string, string> = { "content-type": "application/json" };
-    if (this.cfg.apiKey) h.authorization = `Bearer ${this.cfg.apiKey}`;
+    if (this.cfg.apiKey) h["X-API-Key"] = this.cfg.apiKey;
     return h;
+  }
+
+  private assetId(ca: ChainAsset): string {
+    return this.cfg.registry.require(chainCode(ca), ca.asset).assetId;
   }
 
   async quote(op: Operation): Promise<Quote> {
     const body = {
       dry: false,
+      depositType: this.cfg.depositType ?? "ORIGIN_CHAIN",
       swapType: "EXACT_OUTPUT",
-      slippageTolerance: 100,
-      originAsset: assetId(op.origin),
-      destinationAsset: assetId(op.destination),
+      slippageTolerance: this.cfg.slippageBps ?? 100,
+      originAsset: this.assetId(op.origin),
+      destinationAsset: this.assetId(op.destination),
       amount: op.amount.amount.toString(),
       recipient: op.recipient,
       recipientType: "DESTINATION_CHAIN",
-      refundTo: op.refundTo,
+      refundTo: this.cfg.refundTo,
       refundType: "ORIGIN_CHAIN",
-      deadline: op.deadline,
-      ...(this.cfg.appFeeBps && this.cfg.appFeeRecipient
-        ? { appFees: [{ recipient: this.cfg.appFeeRecipient, fee: this.cfg.appFeeBps }] }
-        : {}),
+      deadline: new Date(Date.now() + (this.cfg.deadlineMs ?? 3_600_000)).toISOString(),
+      ...(this.cfg.appFee ? { appFees: [this.cfg.appFee] } : {}),
     };
-    const res = await this.fetch(`${ONE_CLICK_BASE}/quote`, {
+
+    const res = await this.fetch(`${this.baseUrl}/v0/quote`, {
       method: "POST",
       headers: this.headers(),
       body: JSON.stringify(body),
     });
-    if (!res.ok) throw new Error(`1Click quote failed: ${res.status}`);
-    const json = (await res.json()) as {
-      quote: { depositAddress: string; deadline: string; amountIn: string; amountOut: string };
-      quoteRequest?: unknown;
-    };
-    return {
-      quoteId: (json as { correlationId?: string }).correlationId ?? "quote",
-      amountIn: BigInt(json.quote.amountIn),
+    if (!res.ok) throw new RailError(this.name, res.status, await errorMessage(res));
+    const json = (await res.json()) as QuoteResponseBody;
+
+    const quote: Quote = {
+      quoteId: json.correlationId,
       amountOut: BigInt(json.quote.amountOut),
-      feeIn: 0n,
+      minAmountOut: BigInt(json.quote.minAmountOut),
+      amountIn: BigInt(json.quote.amountIn),
+      minAmountIn: BigInt(json.quote.minAmountIn),
+      feeIn: BigInt(json.quote.withdrawFee ?? "0"),
       depositAddress: json.quote.depositAddress,
-      deadline: json.quote.deadline,
+      ...(json.quote.depositMemo ? { depositMemo: json.quote.depositMemo } : {}),
+      deadline: json.quote.deadline ?? body.deadline,
+      evidence: json.signature,
     };
+    if (quote.depositMemo) this.memos.set(op.id, quote.depositMemo);
+    return quote;
   }
 
-  async submit(_op: Operation, quote: Quote): Promise<SettlementResult> {
-    // ORIGIN_CHAIN deposits are made on-chain by the signer; the rail observes
-    // them. With `depositType: INTENTS` this becomes generate-intent/submit-intent.
-    return { operationId: _op.id, status: "submitted", quoteId: quote.quoteId };
+  /**
+   * Tells 1Click the deposit was broadcast so it can verify preemptively. When
+   * the signer has not yet broadcast, this is a no-op and the rail reports
+   * `submitted`: the deposit address is live and funds may arrive later.
+   */
+  async submit(op: Operation, quote: Quote, proof?: DepositProof): Promise<SettlementResult> {
+    if (!proof) {
+      return { operationId: op.id, status: "submitted", quoteId: quote.quoteId };
+    }
+    const res = await this.fetch(`${this.baseUrl}/v0/deposit/submit`, {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify({
+        txHash: proof.txHash,
+        depositAddress: quote.depositAddress,
+        ...(proof.nearSenderAccount ? { nearSenderAccount: proof.nearSenderAccount } : {}),
+        ...(quote.depositMemo ? { memo: quote.depositMemo } : {}),
+      }),
+    });
+    if (!res.ok) throw new RailError(this.name, res.status, await errorMessage(res));
+    const json = (await res.json()) as StatusBody;
+    return this.toResult(op.id, quote.quoteId, json);
   }
 
-  async poll(operationId: string): Promise<SettlementResult> {
-    const res = await this.fetch(`${ONE_CLICK_BASE}/status?depositAddress=${operationId}`, {
+  async poll(operationId: string, quote?: Quote): Promise<SettlementResult> {
+    const params = new URLSearchParams({ depositAddress: quote?.depositAddress ?? operationId });
+    const memo = quote?.depositMemo ?? this.memos.get(operationId);
+    if (memo) params.set("depositMemo", memo);
+    const res = await this.fetch(`${this.baseUrl}/v0/status?${params.toString()}`, {
       method: "GET",
       headers: this.headers(),
     });
-    if (!res.ok) throw new Error(`1Click status failed: ${res.status}`);
-    const json = (await res.json()) as { status: string; swapDetails?: { destinationChainTxHashes?: { hash: string }[] } };
+    if (!res.ok) throw new RailError(this.name, res.status, await errorMessage(res));
+    const json = (await res.json()) as StatusBody;
+    return this.toResult(operationId, quote?.quoteId, json);
+  }
+
+  private toResult(operationId: string, quoteId: string | undefined, json: StatusBody): SettlementResult {
+    const status = mapStatus(json.status);
     const txHash = json.swapDetails?.destinationChainTxHashes?.[0]?.hash;
-    const status: SettlementResult["status"] =
-      json.status === "SUCCESS"
-        ? "settled"
-        : json.status === "FAILED" || json.status === "REFUNDED"
-          ? (json.status.toLowerCase() as SettlementResult["status"])
-          : "pending";
-    return { operationId, status, ...(txHash ? { txHash } : {}) };
+    const intentHashes = json.swapDetails?.intentHashes ?? [];
+    const evidence =
+      json.correlationId || txHash
+        ? JSON.stringify({ correlationId: json.correlationId, txHash, intentHashes })
+        : undefined;
+    const failureReason =
+      status === "failed" || status === "refunded"
+        ? (json.swapDetails?.refundReason ?? json.status)
+        : undefined;
+    return {
+      operationId,
+      status,
+      ...(quoteId ? { quoteId } : {}),
+      ...(txHash ? { txHash } : {}),
+      ...(evidence ? { evidence } : {}),
+      ...(failureReason ? { failureReason } : {}),
+    };
+  }
+}
+
+async function errorMessage(res: Response): Promise<string> {
+  try {
+    const body = (await res.json()) as { message?: string };
+    return body.message ?? `HTTP ${res.status}`;
+  } catch {
+    return `HTTP ${res.status}`;
   }
 }

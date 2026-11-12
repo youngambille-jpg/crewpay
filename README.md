@@ -19,7 +19,7 @@ This is the skeleton, with the two parts that matter most implemented and tested
 | `packages/domain` | done | Types: money, payees, operations, pay runs, policies |
 | `packages/policy` | **done + tested** | The deterministic constraint engine (the moat) |
 | `packages/ledger` | **done + tested** | Double-entry journal with balanced-entry enforcement |
-| `packages/rails` | started | `SettlementRail` interface, `FakeRail`, 1Click adapter |
+| `packages/rails` | **done + tested** | `SettlementRail`, `FakeRail`, and a 1Click adapter written to the live spec |
 | `apps/agent` | started + tested | Pay-run orchestrator: policy → rail → ledger |
 | `apps/api` | started + tested | Control plane over `node:http`, in-memory store |
 
@@ -36,10 +36,11 @@ No build step and no runtime dependencies are needed for the core packages.
 ## Use
 
 ```bash
-npm install       # links the workspace packages
-npm test          # 30 tests across policy, ledger, agent and api
-npm run demo      # end-to-end pay run against the FakeRail
-npm run typecheck # strict tsc, no emit
+npm install        # links the workspace packages
+npm test           # 49 tests across policy, ledger, rails, agent and api
+npm run demo       # end-to-end pay run against the FakeRail
+npm run verify:tokens  # check the pinned asset table against live 1Click
+npm run typecheck  # strict tsc, no emit
 ```
 
 The demo seeds four payees and runs one pay run. Expected result: two
@@ -61,8 +62,10 @@ one agent payee over the per-kind cap is denied.
 
 1. `policy` and `ledger` — done.
 2. `api` and `agent` skeletons — done.
-3. Wire `OneClickRail` to the live 1Click API (quote → sign → submit → status).
-4. OutLayer integration: TEE wallet, policy manifest, approval tasks.
-5. PingPay integration: invoice checkout + webhook → auto pay run.
-6. Agent payees via x402/MPP per-task settlement.
-7. Treasury: Earn, limit orders, sweeps. Accounting exports.
+3. `OneClickRail` against the live 1Click API — done (spec-accurate, tested
+   against recorded fixtures, asset table drift-guarded).
+4. Signer: broadcast the deposit and pass a `DepositProof` to `submit`.
+5. OutLayer integration: TEE wallet, policy manifest, approval tasks.
+6. PingPay integration: invoice checkout + webhook → auto pay run.
+7. Agent payees via x402/MPP per-task settlement.
+8. Treasury: Earn, limit orders, sweeps. Accounting exports.
