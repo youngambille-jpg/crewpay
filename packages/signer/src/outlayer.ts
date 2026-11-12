@@ -8,7 +8,14 @@ import {
   isTerminalStatus,
   type OutLayerRequestRow,
 } from "./outlayer-client.ts";
-import { SignerError, type FundingOutcome, type FundingPlan, type Signer, type SignerWallet } from "./signer.ts";
+import {
+  SignerError,
+  type CustodyPolicy,
+  type FundingOutcome,
+  type FundingPlan,
+  type Signer,
+  type SignerWallet,
+} from "./signer.ts";
 
 export interface OutLayerSignerConfig {
   /** `wk_` API key for a custody wallet. The only secret the signer holds. */
@@ -72,6 +79,23 @@ export class OutLayerSigner implements Signer {
     this.cachedWallet = { walletId: address, nearAccountId: address };
     return this.cachedWallet;
   }
+
+  /**
+   * The wallet's own custody state. Policy is read, not written: it belongs to
+   * the wallet's owner, and an agent that could widen its own limits would make
+   * the limits meaningless.
+   */
+  readonly custody: CustodyPolicy = {
+    effectivePolicy: () => this.client.getPolicy(),
+    openApprovals: async () => {
+      const rows = await this.client.pendingApprovals();
+      return rows.map((r) => ({
+        approvalId: r.approval_id,
+        ...(r.request_id ? { requestId: r.request_id } : {}),
+        ...(r.status ? { status: r.status } : {}),
+      }));
+    },
+  };
 
   plan(operation: Operation, quote: Quote): FundingPlan {
     // A memo pins the deposit to this quote on chains that use one.

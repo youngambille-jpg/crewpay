@@ -10,8 +10,14 @@ function base(chain: string, asset: string) {
   return { chain, asset };
 }
 
-async function start(opts: ConstructorParameters<typeof FakeRail>[0] = {}) {
-  const { server, store } = createApi({ rail: new FakeRail(opts) });
+async function start(
+  opts: ConstructorParameters<typeof FakeRail>[0] & { signer?: FakeSigner } = {},
+) {
+  const { signer, ...railOpts } = opts;
+  const { server, store } = createApi({
+    rail: new FakeRail(railOpts),
+    ...(signer ? { signer } : {}),
+  });
   await new Promise<void>((resolve) => server.listen(0, resolve));
   const port = (server.address() as AddressInfo).port;
   const url = `http://127.0.0.1:${port}`;
@@ -311,3 +317,93 @@ test("executing an approved operation carries the signer proof through", async (
   }
 });
 
+
+test("the manifest endpoint compiles the active policy and warns on local-only rules", async () => {
+  const { server, call } = await start();
+  try {
+    await call("/v1/policies", "POST", {
+      orgId: "org_1",
+      rules: { ...defaultRules(), requireApprovalForNewPayee: true, maxPayeeRiskScore: 70 },
+    });
+    const res = await call("/v1/manifest?orgId=org_1&approvers=owner.near&threshold=1", "GET");
+    assert.equal(res.status, 200);
+
+    const manifest = res.json["manifest"] as Record<string, unknown>;
+    const limits = manifest["limits"] as Record<string, string>;
+    assert.equal(limits["per_transaction"], "5000.00");
+    assert.equal(limits["daily"], "50000.00");
+
+    const multisig = manifest["multisig"] as Record<string, unknown>;
+    assert.equal(multisig["approval_above"], "2000.00");
+    assert.deepEqual(multisig["approvers"], ["owner.near"]);
+
+    // New-payee and risk-score rules have no OutLayer equivalent, so they are
+    // reported rather than quietly dropped.
+    const codes = (res.json["warnings"] as { code: string }[]).map((w) => w.code).sort();
+    assert.deepEqual(codes, ["NEW_PAYEE_APPROVAL", "RISK_SCORE"]);
+  } finally {
+    server.close();
+  }
+});
+
+test("the manifest endpoint needs an org with an active policy", async () => {
+  const { server, call } = await start();
+  try {
+    assert.equal((await call("/v1/manifest", "GET")).status, 400);
+    assert.equal((await call("/v1/manifest?orgId=org_missing", "GET")).status, 400);
+  } finally {
+    server.close();
+  }
+});
+
+test("the manifest is diffed against the wallet's effective policy", async () => {
+  const signer = new FakeSigner({
+    effectivePolicy: {
+      // The owner set a looser daily cap than we proposed.
+      limits: { per_transaction: "5000.00", daily: "999999.00" },
+      multisig: { approvers: ["owner.near"], threshold: 1, approval_above: "2000.00" },
+      tokens: { allowed: ["usdc", "usdt", "dai"] },
+      chains: { allowed: [] },
+      transaction_types: ["intents_withdraw", "intents_transfer", "call", "transfer"],
+      capabilities: {
+        intents_withdraw: true,
+        intents_transfer: true,
+        call: true,
+        swap: false,
+        cross_chain_withdraw: false,
+        limit_order: false,
+        payment_check: false,
+        raw_sign: { allowed: false, chains: [] },
+        evm_sign: { allowed: false, raw_tx: false },
+        solana_sign: { allowed: false, raw_tx: false },
+        intents_call: false,
+      },
+    },
+  });
+  const { server, call } = await start({ signer });
+  try {
+    await call("/v1/policies", "POST", {
+      orgId: "org_1",
+      rules: { ...defaultRules(), requireApprovalForNewPayee: false },
+    });
+    const res = await call("/v1/manifest?orgId=org_1&approvers=owner.near&threshold=1", "GET");
+    const drift = res.json["drift"] as { field: string }[];
+    assert.deepEqual(drift.map((d) => d.field), ["limits.daily"]);
+  } finally {
+    server.close();
+  }
+});
+
+test("the custody approvals endpoint mirrors the wallet's multisig inbox", async () => {
+  const signer = new FakeSigner({
+    openApprovals: [{ approvalId: "apv_wallet_1", requestId: "req_9", status: "pending" }],
+  });
+  const { server, call } = await start({ signer });
+  try {
+    const res = await call("/v1/custody/approvals", "GET");
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.json, [{ approvalId: "apv_wallet_1", requestId: "req_9", status: "pending" }]);
+  } finally {
+    server.close();
+  }
+});

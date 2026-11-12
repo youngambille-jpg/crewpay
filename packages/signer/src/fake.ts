@@ -1,6 +1,6 @@
 import type { Operation } from "@crewpay/domain";
 import type { Quote } from "@crewpay/rails";
-import type { FundingOutcome, FundingPlan, Signer, SignerWallet } from "./signer.ts";
+import type { CustodyPolicy, FundingOutcome, FundingPlan, Signer, SignerWallet } from "./signer.ts";
 
 export interface FakeSignerOptions {
   /** Operations that fund successfully but report no tx identifier. */
@@ -14,6 +14,10 @@ export interface FakeSignerOptions {
   /** Operations that never settle within the poll budget. */
   readonly stuckOperationIds?: readonly string[];
   readonly wallet?: SignerWallet;
+  /** The wallet's effective policy, as the custody service would report it. */
+  readonly effectivePolicy?: Record<string, unknown>;
+  /** Multisig approvals the wallet is waiting on. */
+  readonly openApprovals?: readonly { approvalId: string; requestId?: string; status?: string }[];
 }
 
 /**
@@ -76,4 +80,13 @@ export class FakeSigner implements Signer {
   private proofFor(plan: FundingPlan, id: string): string {
     return plan.route === "intents" ? `0xdeposit_${id}` : `tx_${id}`;
   }
+
+  /**
+   * Offline stand-in for the wallet's custody state, so the inbox's mirroring
+   * of OutLayer's multisig approvals is exercised without a network.
+   */
+  readonly custody: CustodyPolicy = {
+    effectivePolicy: async () => this.cfg.effectivePolicy ?? {},
+    openApprovals: async () => this.cfg.openApprovals ?? [],
+  };
 }

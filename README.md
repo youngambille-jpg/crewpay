@@ -37,9 +37,9 @@ No build step and no runtime dependencies are needed for the core packages.
 
 ```bash
 npm install        # links the workspace packages
-npm test           # 94 tests across policy, ledger, rails, signer, agent and api
+npm test           # 116 tests across policy, ledger, rails, signer, agent and api
 npm run demo       # end-to-end pay run against the FakeRail + FakeSigner
-npm run test:signer    # signer outcome and idempotency tests only
+npm run test:signer    # signer outcome, manifest and idempotency tests only
 npm run verify:tokens  # check the pinned asset table against live 1Click
 npm run typecheck  # strict tsc, no emit
 ```
@@ -48,6 +48,7 @@ The demo seeds four payees and runs one pay run. Expected result: one contractor
 settles (with a deposit proof), one operation's funding is escalated to
 `needsReview`, one vendor over the approval threshold opens an approval that is
 then approved and executed, and one agent payee over the per-kind cap is denied.
+It finishes by printing the policy compiled to an OutLayer manifest.
 
 ## Design rules
 
@@ -70,8 +71,9 @@ then approved and executed, and one agent payee over the per-kind cap is denied.
    to `submit` — done (`packages/signer`, four-way funding outcome, idempotent).
 5. Approvals inbox: frozen operation, approve/reject/execute, re-validated
    against the current policy at execution — done (`/v1/approvals`).
-6. OutLayer policy manifest: the org policy as an on-chain manifest, multisig
-   tasks mirroring the inbox.
+6. Policy manifest: `PolicyRules` compiled to an OutLayer manifest, with the
+   wallet's effective policy read back and diffed for drift — done
+   (`/v1/manifest`, `/v1/custody/approvals`).
 7. PingPay integration: invoice checkout + webhook → auto pay run.
 8. Agent payees via x402/MPP per-task settlement.
 9. Treasury: Earn, limit orders, sweeps. Accounting exports.

@@ -81,4 +81,11 @@ console.log("approved:", JSON.stringify(decided, null, 2));
 const executed = await post(`/v1/approvals/${approvalId}/execute`, {});
 console.log("executed:", JSON.stringify(executed, null, 2));
 
+// The same policy compiled into the manifest we hand the custody wallet's
+// owner, with the rules OutLayer cannot enforce called out.
+const manifest = await (
+  await fetch(`${base}/v1/manifest?orgId=org_1&approvers=owner.near&threshold=1`)
+).json();
+console.log("manifest:", JSON.stringify(manifest, null, 2));
+
 server.close();

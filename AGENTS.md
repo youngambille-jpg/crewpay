@@ -155,10 +155,41 @@ There is no build step. There are no runtime dependencies in the core packages.
   not found, **409 for a state conflict** (wrong approval status, stale
   approval, failed execution).
 
+## OutLayer custody notes (read from the skill docs, not guessed)
+
+Docs live at `https://skills.outlayer.ai/agent-custody/SKILL.md` plus
+`references/*.md` (one file per job; do not read them all). Hosts:
+`api.outlayer.ai` (mainnet) and `testnet-api.outlayer.ai` — not `api-testnet.`
+or `testnet.api.`, which do not resolve. NEAR Intents do not exist on testnet.
+
+- **Policy is owner-authored, not agent-authored.** There is no agent endpoint
+  that writes a wallet policy; the owner sets it in the dashboard
+  (`https://app.outlayer.ai/wallet?key={api_key}`). This is deliberate: the party
+  being limited must not set the limit. So `compileManifest` is a *proposal* we
+  hand the owner, and the agent only reads the effective policy back and diffs.
+  Never add a "publish policy" call — it would be inventing an endpoint.
+- **Multisig requests never settle by polling.** A request on a multisig wallet
+  returns `status: "pending_approval"` and moves only when a human votes. Polling
+  it spins until a false escalation — `isPollableStatus` deliberately excludes
+  `pending_approval` and `approved` for this reason.
+- **Two approval routes, two audiences.** `GET /wallet/v1/pending_approvals`
+  takes the wallet's `wk_` key (this is ours). The dashboard route
+  `pending_approvals_by_pubkey` needs an owner *session* and answers
+  `session_required` for an agent. One approval by id (`approval/{id}`) needs no
+  session.
+- **Capability toggles are default-DENY.** A wallet that only funds deposits
+  needs `intents_withdraw`, `intents_transfer`, `call`. `raw_sign`, `evm_sign`,
+  `solana_sign` stay off; `intents_call` is always false — a call to
+  `intents.near` can add a key that signs outside the TEE permanently.
+- **Multisig limits:** at most 16 approval votes and 16 rejections per signing
+  request. A policy with more than 16 approvers can never reach its threshold, so
+  `compileManifest` warns above that (`MAX_APPROVERS`).
+- `pending_approval` is "not an error"; `needs_review` means fund state is
+  UNKNOWN and must not be retried; `rejected` is a terminal failure.
+
 ## Status
 
 Done and tested: `domain`, `policy`, `ledger`, `rails` (incl. 1Click adapter),
 `signer` (OutLayer TEE custody + FakeSigner), agent orchestration, api skeleton,
-approvals inbox. 94 tests.
-Not started: OutLayer policy manifest, PingPay, x402/MPP agent payouts,
-Postgres persistence, web UI.
+approvals inbox, policy manifest + drift. 116 tests.
+Not started: PingPay, x402/MPP agent payouts, Postgres persistence, web UI.

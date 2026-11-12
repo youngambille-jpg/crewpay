@@ -55,9 +55,33 @@ export class SignerError extends Error {
 }
 
 /**
+ * The custody policy surface. OutLayer's policy is authored by the wallet's
+ * owner in the dashboard, not by the agent, so this is read-and-propose rather
+ * than write: the compiled manifest is what we ask the owner to approve, and
+ * the effective policy is what we diff against at runtime.
+ */
+export interface CustodyPolicy {
+  /**
+   * Read the policy the TEE actually enforces. This governs money, and it is
+   * the owner's, so it can differ from what we proposed.
+   */
+  effectivePolicy(): Promise<Record<string, unknown>>;
+  /**
+   * Multisig approvals waiting on the wallet. A request that returned
+   * `pending_approval` settles only when a human votes, so this is how such an
+   * operation is found rather than polled into a false escalation.
+   */
+  openApprovals(): Promise<readonly { approvalId: string; requestId?: string; status?: string }[]>;
+}
+
+/**
  * A signer funds an operation's deposit and returns proof that it was
  * broadcast. It never exposes a key: signing happens inside a TEE and the
  * signer holds only an API key. `FakeSigner` is the offline implementation.
+ *
+ * `custody` is optional so a funding-only signer stays valid; the OutLayer
+ * implementations provide it so the approvals inbox can mirror the wallet's own
+ * multisig state.
  */
 export interface Signer {
   readonly name: string;
@@ -65,4 +89,5 @@ export interface Signer {
   /** Decide, without side effects, how this operation's deposit will be funded. */
   plan(operation: Operation, quote: Quote): FundingPlan;
   fund(operation: Operation, quote: Quote, plan: FundingPlan): Promise<FundingOutcome>;
+  readonly custody?: CustodyPolicy;
 }

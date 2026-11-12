@@ -73,6 +73,8 @@ GET    /v1/approvals                   approvals inbox (?orgId=&status=)
 POST   /v1/approvals/:id/approve       one-signature owner approval
 POST   /v1/approvals/:id/reject        decline, with a reason
 POST   /v1/approvals/:id/execute       pay an approved operation (re-checks policy)
+GET    /v1/manifest                    compile the policy to an OutLayer manifest + drift
+GET    /v1/custody/approvals           mirror the wallet's own multisig inbox
 POST   /v1/invoices                    issue an invoice (PingPay checkout)
 POST   /v1/webhooks/pingpay            payment settled -> trigger pay run / reconcile
 POST   /v1/webhooks/1click             swap status transitions
@@ -245,6 +247,53 @@ pending ──approve──▶ approved ──execute──▶ executed
    ├──reject──▶ rejected
    └──(policy changed at execute time)────▶ stale
 ```
+
+### 3.5b Two policy layers, and which one wins
+
+The policy is enforced twice, by two engines that do not share code, on purpose.
+Ours (`packages/policy`) is deterministic and evaluates the operation before
+anything is funded. OutLayer's lives in the TEE and evaluates the transaction
+the custody wallet is about to sign. The second one is the backstop: it holds
+even if our engine has a bug, or is bypassed, or the agent is compromised.
+
+`compileManifest` turns our `PolicyRules` into the manifest OutLayer understands
+and reports the rules that did **not** travel:
+
+| Crewpay rule | OutLayer manifest | Note |
+|---|---|---|
+| `maxPerTransactionCents`, `maxDailyCents` | `limits.per_transaction`, `limits.daily` | decimal strings, never floats |
+| `approvalThresholdCents` | `multisig.approval_above` | the wallet's own ballot gates it too |
+| `allowedCorridors` | `chains.allowed` | |
+| `allowedAssets` | `tokens.allowed` | |
+| `schedule` | `time_restrictions` | needs the org timezone |
+| `requireApprovalForNewPayee` | — | no payee-history concept upstream; warned |
+| `maxPayeeRiskScore` | — | no scoring upstream; warned |
+| `allowedPayeeKinds` | — | no kind model upstream; warned |
+
+The warnings are the honest part. A rule with no equivalent keeps its protection
+in our engine and only ours, and the API says so rather than implying the
+manifest covers it. Two consequences that shape the design:
+
+**The manifest is a proposal, not a write.** OutLayer policy is authored by the
+wallet's owner in the dashboard; there is no agent endpoint that sets it, and
+that is deliberate — the party being limited must not be the party that sets the
+limit. So `GET /v1/manifest` compiles the rules and hands them over, and the
+agent can only ever *read back* the effective policy. It reads, diffs, and
+reports drift; it never rewrites the owner's policy to match its own idea of it.
+
+**Every signing door is shut by default.** OutLayer capability toggles default
+to DENY, so the manifest states them explicitly: funding a deposit needs
+`intents_withdraw`, `intents_transfer` and `call`, and nothing else. `raw_sign`,
+`evm_sign` and `solana_sign` stay off, and `intents_call` is always false (a
+call to `intents.near` can add a key that signs outside the TEE for good). A
+compromise of the agent therefore cannot extract arbitrary signatures — only
+move money within the limits the owner already agreed to.
+
+The two inboxes are distinct and both are surfaced. `GET /v1/approvals` is our
+own approval record, where a human clears an operation our engine held back.
+`GET /v1/custody/approvals` mirrors the wallet's multisig inbox, where a human
+votes on a request the TEE held back — a request that returned
+`pending_approval` settles only on a vote, so it is read, never polled.
 
 ### 3.6 `store` — Postgres
 
@@ -436,8 +485,9 @@ agent worker (Node)  ─┘        │
    double-pays.
 7. **Approval workflow** — `Approval` inbox with approve/reject/execute; a
    frozen operation, re-validated against the current policy at execution.
-8. **OutLayer policy manifest** — the org policy as an on-chain manifest,
-   multisig tasks mirroring the inbox.
+8. **Policy manifest** — `compileManifest` turns `PolicyRules` into an OutLayer
+   manifest, warns on rules with no upstream equivalent, and diffs the wallet's
+   effective policy for drift (`/v1/manifest`, `/v1/custody/approvals`).
 9. **PingPay integration** — invoice checkout + webhook → auto pay run.
 10. **Agent payees** — x402/MPP per-task settlement + 1099-style export.
 11. **Treasury** — Earn, limit orders, sweeps.

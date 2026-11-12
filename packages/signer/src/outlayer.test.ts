@@ -241,3 +241,40 @@ test("loadWallet caches the address and fund uses the deposit address", async ()
   await s.fund(op(), quote(), s.plan(op(), quote()));
   assert.equal(calls[1]!.body!["to"], "0xdeposit");
 });
+
+test("the custody surface reads the wallet's policy and open approvals", async () => {
+  const fn = async (url: string | URL) => {
+    const path = new URL(String(url)).pathname;
+    if (path === "/wallet/v1/policy") {
+      return new Response(JSON.stringify({ limits: { daily: "1000.00" } }), { status: 200 });
+    }
+    if (path === "/wallet/v1/pending_approvals") {
+      return new Response(
+        JSON.stringify([{ approval_id: "apv_1", request_id: "req_1", status: "pending" }]),
+        { status: 200 },
+      );
+    }
+    return new Response("{}", { status: 404 });
+  };
+  const signer = new OutLayerSigner({
+    apiKey: "wk_test",
+    baseUrl: "https://api.outlayer.ai",
+    fetchImpl: fn as unknown as typeof fetch,
+  });
+
+  assert.deepEqual(await signer.custody.effectivePolicy(), { limits: { daily: "1000.00" } });
+  assert.deepEqual(await signer.custody.openApprovals(), [
+    { approvalId: "apv_1", requestId: "req_1", status: "pending" },
+  ]);
+});
+
+test("pending_approvals accepts both a bare array and an approvals wrapper", async () => {
+  const wrapped = async () =>
+    new Response(JSON.stringify({ approvals: [{ approval_id: "apv_2" }] }), { status: 200 });
+  const signer = new OutLayerSigner({
+    apiKey: "wk_test",
+    baseUrl: "https://api.outlayer.ai",
+    fetchImpl: wrapped as unknown as typeof fetch,
+  });
+  assert.deepEqual(await signer.custody.openApprovals(), [{ approvalId: "apv_2" }]);
+});

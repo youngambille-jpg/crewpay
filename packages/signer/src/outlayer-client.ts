@@ -25,6 +25,20 @@ export interface OutLayerRequestRow {
   readonly result?: Record<string, unknown> | null;
 }
 
+/**
+ * One multisig approval waiting on the wallet. OutLayer keeps these beside the
+ * request they gate: the request is `pending_approval` until the ballot passes
+ * its threshold, and settles only when a human votes. Polling the request will
+ * never move it, which is why this is read separately.
+ */
+export interface OutLayerApproval {
+  readonly approval_id: string;
+  readonly request_id?: string;
+  readonly status?: string;
+  readonly type?: string;
+  readonly created_at?: string;
+}
+
 export interface OutLayerClientConfig {
   readonly apiKey: string;
   readonly baseUrl?: string;
@@ -135,6 +149,34 @@ export class OutLayerClient {
   async getRequest(id: string): Promise<OutLayerRequestRow> {
     const res = await this.send("GET", `/wallet/v1/requests/${encodeURIComponent(id)}`);
     return res.body as unknown as OutLayerRequestRow;
+  }
+
+  /**
+   * Read the wallet's effective policy. This is the policy the TEE enforces,
+   * which is authored by the wallet's owner rather than by us, so it is read
+   * and diffed rather than assumed.
+   */
+  async getPolicy(): Promise<Record<string, unknown>> {
+    const res = await this.send("GET", "/wallet/v1/policy");
+    return res.body;
+  }
+
+  /**
+   * The wallet's open multisig approvals. A `pending_approval` request settles
+   * only when a human votes, so this is how an operation stuck in that state is
+   * found. The dashboard route (`pending_approvals_by_pubkey`) needs an owner
+   * session; this one takes the wallet's own `wk_` key.
+   */
+  async pendingApprovals(): Promise<readonly OutLayerApproval[]> {
+    const res = await this.send("GET", "/wallet/v1/pending_approvals");
+    const rows = Array.isArray(res.body) ? res.body : (res.body["approvals"] as unknown[]) ?? [];
+    return rows as unknown as readonly OutLayerApproval[];
+  }
+
+  /** Read one approval by id. This route needs no owner session. */
+  async getApproval(id: string): Promise<OutLayerApproval> {
+    const res = await this.send("GET", `/wallet/v1/approval/${encodeURIComponent(id)}`);
+    return res.body as unknown as OutLayerApproval;
   }
 
   /**

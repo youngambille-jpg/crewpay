@@ -3,6 +3,7 @@ import type { Approval, Operation, PayRun, PayRunItem, Payee, Policy } from "@cr
 import { defaultRules, corridor } from "@crewpay/domain";
 import type { SettlementRail } from "@crewpay/rails";
 import type { Signer } from "@crewpay/signer";
+import { compileManifest, diffManifest, type ManifestDrift } from "@crewpay/signer";
 import { executeApproved, executeRun } from "@crewpay/agent";
 import { activePolicy, createStore, type Store } from "./store.ts";
 
@@ -228,6 +229,48 @@ async function handle(
 
   if (method === "GET" && url.pathname === "/v1/pay-runs") {
     return send(res, 200, [...store.payRuns.values()]);
+  }
+
+  if (method === "GET" && url.pathname === "/v1/manifest") {
+    const orgId = url.searchParams.get("orgId");
+    if (!orgId) return send(res, 400, { error: "orgId is required" });
+    const policy = activePolicy(store, orgId);
+    if (!policy) return send(res, 400, { error: "no active policy for org" });
+
+    const approvers = url.searchParams.get("approvers")?.split(",").filter(Boolean) ?? [];
+    const thresholdParam = url.searchParams.get("threshold");
+    const timezone = url.searchParams.get("timezone");
+    const compiled = compileManifest(policy.rules, {
+      approvers,
+      ...(thresholdParam ? { threshold: Number(thresholdParam) } : {}),
+      ...(timezone ? { timezone } : {}),
+    });
+
+    // The policy the TEE enforces is the owner's, so read it and diff rather
+    // than assume ours was installed. Absent a custody signer there is nothing
+    // to compare against, and the manifest stands alone.
+    let drift: readonly ManifestDrift[] | undefined;
+    let effective: Record<string, unknown> | undefined;
+    if (deps.signer?.custody) {
+      effective = await deps.signer.custody.effectivePolicy();
+      drift = diffManifest(compiled.manifest, effective);
+    }
+
+    return send(res, 200, {
+      policyId: policy.id,
+      policyVersion: policy.version,
+      manifest: compiled.manifest,
+      warnings: compiled.warnings,
+      ...(effective ? { effectivePolicy: effective } : {}),
+      ...(drift ? { drift } : {}),
+    });
+  }
+
+  if (method === "GET" && url.pathname === "/v1/custody/approvals") {
+    // The wallet's own multisig inbox. A request stuck at `pending_approval`
+    // settles only when a human votes, so it is read here rather than polled.
+    if (!deps.signer?.custody) return send(res, 200, []);
+    return send(res, 200, await deps.signer.custody.openApprovals());
   }
 
   if (method === "GET" && url.pathname === "/v1/approvals") {
