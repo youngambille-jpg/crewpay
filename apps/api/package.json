@@ -1,0 +1,13 @@
+{
+  "name": "@crewpay/api",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@crewpay/agent": "0.0.0",
+    "@crewpay/domain": "0.0.0",
+    "@crewpay/policy": "0.0.0",
+    "@crewpay/ledger": "0.0.0",
+    "@crewpay/rails": "0.0.0"
+  }
+}
