@@ -76,6 +76,7 @@ POST   /v1/approvals/:id/execute       pay an approved operation (re-checks poli
 GET    /v1/manifest                    compile the policy to an OutLayer manifest + drift
 GET    /v1/custody/approvals           mirror the wallet's own multisig inbox
 POST   /v1/invoices                    issue an invoice (PingPay checkout)
+GET    /v1/invoices                    invoices (?orgId=)
 POST   /v1/webhooks/pingpay            payment settled -> trigger pay run / reconcile
 POST   /v1/webhooks/1click             swap status transitions
 GET    /v1/ledger                      journal export (CSV/JSON) + attestations
@@ -295,9 +296,45 @@ own approval record, where a human clears an operation our engine held back.
 votes on a request the TEE held back — a request that returned
 `pending_approval` settles only on a vote, so it is read, never polled.
 
-### 3.6 `store` — Postgres
+### 3.5c Invoices: Ping checkout in, webhook out
 
-Single source of truth for orgs, payees, pay runs, operations, decisions,
+An invoice is a customer-facing obligation; a Ping checkout session is how it
+gets paid. They are separate records because a session can expire and be
+re-created while the invoice stays the same debt, and because the only handle
+needed to ask Ping for the truth is the session id.
+
+`POST /v1/invoices` creates a session with Ping's `x-publishable-key` (a `pk_`
+key — safe in a browser, since that is where checkout runs) and stores the
+`sessionUrl` exactly as returned. Ping calls the URL opaque and tells you not to
+build it; we don't. Payment then arrives as a signed webhook, and the handler
+does three things that matter:
+
+**Verify before believing.** The signature is HMAC-SHA256 over
+`${timestamp}.${rawBody}`, so the raw bytes are what get hashed — re-serialising
+parsed JSON would change whitespace and key order and break the check. The
+timestamp must also be inside a tolerance window, or a correctly-signed event
+captured once would verify forever, and a replayed `payment.success` a year
+later would still pass. The comparison is timing-safe; a byte-by-byte `===`
+leaks how much of a guessed signature is right.
+
+**Read back rather than trust.** The webhook is a claim about the past; the
+session is the current truth. So `checkout.session.completed` triggers a
+`GET /checkout/sessions/{id}` and the invoice is marked paid only if Ping
+reports `COMPLETED`. A signed event that says completed while the session says
+`PENDING` does not release money. This is the one test worth reading twice: it
+holds two independent sources and proves the handler prefers the right one.
+
+**Acknowledge retries, act once.** Ping retries until it gets a 2xx, so the same
+event will arrive more than once. Event ids are recorded, and a repeat is
+answered `200 {duplicate: true}` without touching state — otherwise a retried
+`completed` opens a second pay run and pays the contractor twice.
+
+A paid invoice then opens a pay run through the *same* `createPayRun` path a
+posted run uses, so the policy is enforced identically whether a human or a
+webhook started it, and a large invoice is still held for approval. Only
+`COMPLETED` pays: `EXPIRED` and `CANCELLED` are terminal non-payments.
+
+### 3.6 `store` — Postgres for orgs, payees, pay runs, operations, decisions,
 journal, receipts, and webhook events. Redis for the job queue and idempotency
 locks.
 
@@ -488,7 +525,9 @@ agent worker (Node)  ─┘        │
 8. **Policy manifest** — `compileManifest` turns `PolicyRules` into an OutLayer
    manifest, warns on rules with no upstream equivalent, and diffs the wallet's
    effective policy for drift (`/v1/manifest`, `/v1/custody/approvals`).
-9. **PingPay integration** — invoice checkout + webhook → auto pay run.
+9. **PingPay invoices** — hosted checkout, HMAC-verified webhook, read-back
+   before release, and a paid invoice opens a pay run through the same policy
+   path (`/v1/invoices`, `/v1/webhooks/pingpay`).
 10. **Agent payees** — x402/MPP per-task settlement + 1099-style export.
 11. **Treasury** — Earn, limit orders, sweeps.
 12. **Accounting exports** — QuickBooks/Xero sync, attestation bundle.

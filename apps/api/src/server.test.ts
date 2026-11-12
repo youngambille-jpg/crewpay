@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
-import { FakeRail } from "@crewpay/rails";
+import { FakeRail, FakePingPay } from "@crewpay/rails";
 import { FakeSigner } from "@crewpay/signer";
 import { defaultRules } from "@crewpay/domain";
 import { createApi } from "./server.ts";
@@ -11,12 +11,13 @@ function base(chain: string, asset: string) {
 }
 
 async function start(
-  opts: ConstructorParameters<typeof FakeRail>[0] & { signer?: FakeSigner } = {},
+  opts: ConstructorParameters<typeof FakeRail>[0] & { signer?: FakeSigner; pingpay?: FakePingPay } = {},
 ) {
-  const { signer, ...railOpts } = opts;
+  const { signer, pingpay, ...railOpts } = opts;
   const { server, store } = createApi({
     rail: new FakeRail(railOpts),
     ...(signer ? { signer } : {}),
+    ...(pingpay ? { pingpay } : {}),
   });
   await new Promise<void>((resolve) => server.listen(0, resolve));
   const port = (server.address() as AddressInfo).port;
@@ -29,7 +30,13 @@ async function start(
     });
     return { status: res.status, json: (await res.json()) as Record<string, unknown> };
   };
-  return { server, store, call };
+  // Webhooks are verified over the raw bytes, so the tests must send bytes and
+  // headers rather than a re-serialised object.
+  const rawPost = async (path: string, body: string, headers: Record<string, string>) => {
+    const res = await fetch(url + path, { method: "POST", headers, body });
+    return { status: res.status, json: (await res.json()) as Record<string, unknown> };
+  };
+  return { server, store, call, rawPost };
 }
 
 /** Seed one org with a policy, a payee, and a run that needs approval. */
@@ -405,5 +412,261 @@ test("the custody approvals endpoint mirrors the wallet's multisig inbox", async
     assert.deepEqual(res.json, [{ approvalId: "apv_wallet_1", requestId: "req_9", status: "pending" }]);
   } finally {
     server.close();
+  }
+});
+
+// --- PingPay invoices: checkout -> webhook -> auto pay run ------------------
+
+const PING_SECRET = "whsec_test_secret";
+
+function pingApi(
+  opts: { sessionStatus?: "COMPLETED" | "PENDING"; readBackStatus?: "COMPLETED" | "PENDING" } = {},
+) {
+  return new FakePingPay({
+    webhookSecret: PING_SECRET,
+    ...(opts.sessionStatus ? { sessionStatus: opts.sessionStatus } : {}),
+    ...(opts.readBackStatus ? { readBackStatus: opts.readBackStatus } : {}),
+  });
+}
+
+/** Post a signed event to the webhook the way Ping would, headers and all. */
+function postWebhook(
+  started: Awaited<ReturnType<typeof start>>,
+  signed: { body: string; headers: { signature?: string; timestamp?: string } },
+) {
+  return started.rawPost("/v1/webhooks/pingpay", signed.body, {
+    "content-type": "application/json",
+    "x-ping-signature": String(signed.headers.signature),
+    "x-ping-timestamp": String(signed.headers.timestamp),
+  });
+}
+
+/** Seed an org with a policy, an approved payee, and an invoice. */
+async function seedInvoice(
+  started: Awaited<ReturnType<typeof start>>,
+  opts: { amount?: number; autoPayRun?: boolean } = {},
+) {
+  await started.call("/v1/payees", "POST", {
+    id: "ada",
+    orgId: "org_1",
+    kind: "contractor",
+    displayName: "Ada",
+    destination: base("near", "usdc"),
+    address: "ada.near",
+    status: "approved",
+    screening: "clear",
+  });
+  await started.call("/v1/policies", "POST", {
+    orgId: "org_1",
+    rules: { ...defaultRules(), requireApprovalForNewPayee: false },
+  });
+  return started.call("/v1/invoices", "POST", {
+    orgId: "org_1",
+    customerId: "acme",
+    amount: opts.amount ?? 250_000,
+    ...(opts.autoPayRun === false ? {} : { autoPayRun: { payeeId: "ada" } }),
+  });
+}
+
+test("creating an invoice returns a checkout URL and stores it open", async () => {
+  const pingpay = pingApi({ sessionStatus: "PENDING" });
+  const started = await start({ pingpay });
+  try {
+    const res = await seedInvoice(started);
+    assert.equal(res.status, 201);
+    assert.equal(res.json["status"], "open");
+    // The URL is opaque: we store what Ping returned rather than building it.
+    assert.equal(
+      res.json["checkoutUrl"],
+      `https://checkout.pingpay.io/session/${res.json["checkoutSessionId"]}`,
+    );
+
+    const list = await started.call("/v1/invoices?orgId=org_1", "GET");
+    assert.equal((list.json as unknown as unknown[]).length, 1);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("a completed checkout webhook marks the invoice paid and opens the pay run", async () => {
+  const pingpay = pingApi({ sessionStatus: "COMPLETED" });
+  const started = await start({ pingpay });
+  try {
+    // Below the 200_000 approval threshold, so it settles without a human.
+    const invoice = await seedInvoice(started, { amount: 150_000 });
+    const { body, headers } = pingpay.signEvent({
+      id: "evt_paid_1",
+      type: "checkout.session.completed",
+      resourceId: String(invoice.json["checkoutSessionId"]),
+      data: { anything: true },
+    });
+    const res = await postWebhook(started, { body, headers });
+    assert.equal(res.status, 200);
+
+    const updated = res.json["invoice"] as Record<string, unknown>;
+    assert.equal(updated["status"], "paid");
+    assert.ok(updated["paidAt"]);
+
+    const payRun = res.json["payRun"] as Record<string, unknown>;
+    const run = payRun["run"] as Record<string, unknown>;
+    assert.equal(run["source"], "invoice");
+    assert.equal(run["sourceRef"], invoice.json["id"]);
+    assert.equal(payRun["settledCents"], 150_000);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("the session read-back outranks the webhook: a COMPLETED claim on a PENDING session does not pay", async () => {
+  const pingpay = pingApi({ readBackStatus: "PENDING" });
+  const started = await start({ pingpay });
+  try {
+    const invoice = await seedInvoice(started);
+    const { body, headers } = pingpay.signEvent({
+      id: "evt_liar_1",
+      type: "checkout.session.completed",
+      resourceId: String(invoice.json["checkoutSessionId"]),
+    });
+    const res = await postWebhook(started, { body, headers });
+    assert.equal(res.status, 200);
+    assert.equal((res.json["invoice"] as Record<string, unknown>)["status"], "open");
+    assert.equal(res.json["payRun"], undefined);
+    assert.match(String(res.json["note"]), /not completed/);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("a retried webhook is acknowledged but not acted on twice", async () => {
+  const pingpay = pingApi({ sessionStatus: "COMPLETED" });
+  const started = await start({ pingpay });
+  try {
+    const invoice = await seedInvoice(started);
+    const { body, headers } = pingpay.signEvent({
+      id: "evt_dupe_1",
+      type: "checkout.session.completed",
+      resourceId: String(invoice.json["checkoutSessionId"]),
+    });
+    const first = await postWebhook(started, { body, headers });
+    assert.notEqual(first.json["payRun"], undefined);
+
+    const second = await postWebhook(started, { body, headers });
+    assert.equal(second.status, 200);
+    assert.equal(second.json["duplicate"], true);
+    assert.equal(second.json["payRun"], undefined);
+
+    // One run only: a duplicate delivery did not pay the contractor twice.
+    const runs = await started.call("/v1/pay-runs", "GET");
+    assert.equal((runs.json as unknown as unknown[]).length, 1);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("an unsigned webhook is rejected and changes nothing", async () => {
+  const pingpay = pingApi({ sessionStatus: "COMPLETED" });
+  const started = await start({ pingpay });
+  try {
+    const invoice = await seedInvoice(started);
+    const res = await started.rawPost(
+      "/v1/webhooks/pingpay",
+      JSON.stringify({
+        id: "evt_x",
+        type: "checkout.session.completed",
+        resourceId: invoice.json["checkoutSessionId"],
+      }),
+      { "content-type": "application/json" },
+    );
+    assert.equal(res.status, 500);
+    const list = await started.call("/v1/invoices?orgId=org_1", "GET");
+    assert.equal((list.json as unknown as Record<string, unknown>[])[0]!["status"], "open");
+  } finally {
+    started.server.close();
+  }
+});
+
+test("a webhook for an unknown session is acknowledged but reported unmatched", async () => {
+  const pingpay = pingApi();
+  const started = await start({ pingpay });
+  try {
+    const { body, headers } = pingpay.signEvent({
+      id: "evt_orphan_1",
+      type: "checkout.session.completed",
+      resourceId: "cs_does_not_exist",
+    });
+    const res = await postWebhook(started, { body, headers });
+    assert.equal(res.status, 200);
+    assert.equal(res.json["matched"], false);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("an expired checkout marks the invoice expired and never opens a pay run", async () => {
+  const pingpay = pingApi();
+  const started = await start({ pingpay });
+  try {
+    const invoice = await seedInvoice(started);
+    const { body, headers } = pingpay.signEvent({
+      id: "evt_exp_1",
+      type: "checkout.session.expired",
+      resourceId: String(invoice.json["checkoutSessionId"]),
+    });
+    const res = await postWebhook(started, { body, headers });
+    assert.equal((res.json["invoice"] as Record<string, unknown>)["status"], "expired");
+    assert.equal(res.json["payRun"], undefined);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("a failed payment marks the invoice failed", async () => {
+  const pingpay = pingApi();
+  const started = await start({ pingpay });
+  try {
+    const invoice = await seedInvoice(started);
+    const { body, headers } = pingpay.signEvent({
+      id: "evt_fail_1",
+      type: "payment.failed",
+      resourceId: String(invoice.json["checkoutSessionId"]),
+    });
+    const res = await postWebhook(started, { body, headers });
+    assert.equal((res.json["invoice"] as Record<string, unknown>)["status"], "failed");
+  } finally {
+    started.server.close();
+  }
+});
+
+test("a paid invoice still runs through the policy, so a large one awaits approval", async () => {
+  const pingpay = pingApi({ sessionStatus: "COMPLETED" });
+  const started = await start({ pingpay });
+  try {
+    // Default approvalThresholdCents is 200_000, so 500_000 must be held back.
+    const invoice = await seedInvoice(started, { amount: 500_000 });
+    const { body, headers } = pingpay.signEvent({
+      id: "evt_big_1",
+      type: "checkout.session.completed",
+      resourceId: String(invoice.json["checkoutSessionId"]),
+    });
+    const res = await postWebhook(started, { body, headers });
+    const payRun = res.json["payRun"] as Record<string, unknown>;
+    assert.equal(payRun["settledCents"], 0);
+    assert.equal((payRun["approvals"] as unknown[]).length, 1);
+
+    // The approval is attributed to the webhook, not to a human.
+    const approvals = await started.call("/v1/approvals?orgId=org_1&status=pending", "GET");
+    assert.equal((approvals.json as unknown as Record<string, unknown>[])[0]!["requestedBy"], "pingpay");
+  } finally {
+    started.server.close();
+  }
+});
+
+test("invoices are off when no pingpay client is configured", async () => {
+  const started = await start();
+  try {
+    const res = await started.call("/v1/invoices", "POST", { orgId: "org_1", customerId: "acme", amount: 100 });
+    assert.equal(res.status, 400);
+  } finally {
+    started.server.close();
   }
 });

@@ -1,4 +1,4 @@
-import type { Approval, Operation, PayRun, PayRunItem, Payee, Policy } from "@crewpay/domain";
+import type { Approval, ChainAsset, Invoice, Operation, PayRun, PayRunItem, Payee, Policy } from "@crewpay/domain";
 
 export interface Store {
   payees: Map<string, Payee>;
@@ -11,6 +11,11 @@ export interface Store {
   payeeHistory: Map<string, number>;
   /** orgId -> USD cents settled today, for the daily cap on approvals. */
   settledTodayCents: Map<string, number>;
+  invoices: Map<string, Invoice>;
+  /** invoiceId -> the pay run to open when the invoice is paid. */
+  invoicePayRuns: Map<string, { payeeId: string; origin?: ChainAsset }>;
+  /** eventId -> seen marker, so a retried webhook is not acted on twice. */
+  webhookEvents: Map<string, { type: string; at: string }>;
 }
 
 export function createStore(): Store {
@@ -23,6 +28,9 @@ export function createStore(): Store {
     approvals: new Map(),
     payeeHistory: new Map(),
     settledTodayCents: new Map(),
+    invoices: new Map(),
+    invoicePayRuns: new Map(),
+    webhookEvents: new Map(),
   };
 }
 

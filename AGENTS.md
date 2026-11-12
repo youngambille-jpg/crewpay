@@ -187,9 +187,41 @@ or `testnet.api.`, which do not resolve. NEAR Intents do not exist on testnet.
 - `pending_approval` is "not an error"; `needs_review` means fund state is
   UNKNOWN and must not be retried; `rejected` is a terminal failure.
 
+## PingPay notes (read from the docs, not guessed)
+
+Docs: `https://pingpay.gitbook.io/docs/` — every page has a Markdown twin at
+the same URL plus `.md`, and `llms.txt` indexes them all. API base:
+`https://pay.pingpay.io/api`. Hosted checkout lives at
+`https://checkout.pingpay.io/session/{id}`.
+
+- **Two keys, two jobs — never swap them.** Checkout and payment routes take
+  `x-publishable-key` (`pk_`, public by design, runs in the browser). The Agent
+  Pay facilitator (`/agentpay/x402`, `/agentpay/mpp/charge`) takes `x-api-key`
+  and is called server-side. A `pk_` in the agent config is fine; a secret key
+  in a browser would not be.
+- **The session URL is opaque.** Ping says to use it exactly as returned and not
+  to construct it. We store `sessionUrl` verbatim.
+- **Webhook signature** is HMAC-SHA256 hex over `${timestamp}.${rawBody}`, sent
+  as `x-ping-signature` + `x-ping-timestamp`. Hash the **raw bytes** —
+  re-serialising parsed JSON changes whitespace/key order and breaks it. The
+  timestamp needs a tolerance window, or a captured event verifies forever.
+  Compare timing-safe.
+- **Ping retries until 2xx**, so dedupe on the event `id`; a repeat must be
+  acknowledged without acting, or a retried `completed` pays twice.
+- **The webhook is a claim, the session is the truth.** Verify with
+  `GET /checkout/sessions/{id}` before releasing money.
+- Session statuses: `CREATED`, `PENDING`, `COMPLETED`, `EXPIRED`, `CANCELLED`.
+  Only `COMPLETED` means paid. Payment statuses: `PENDING`, `SUCCESS`, `FAILED`.
+- Events: `payment.pending`, `payment.success`, `payment.failed`,
+  `checkout.session.completed`, `checkout.session.expired`. Payload is
+  `{ id, type, resourceId, data, createdAt }` — `resourceId` is the session or
+  payment id, and `data` is free-form ("anything").
+- Webhook endpoints are created in the dashboard, not via the agent API.
+
 ## Status
 
-Done and tested: `domain`, `policy`, `ledger`, `rails` (incl. 1Click adapter),
-`signer` (OutLayer TEE custody + FakeSigner), agent orchestration, api skeleton,
-approvals inbox, policy manifest + drift. 116 tests.
-Not started: PingPay, x402/MPP agent payouts, Postgres persistence, web UI.
+Done and tested: `domain`, `policy`, `ledger`, `rails` (incl. 1Click adapter and
+PingPay checkout/webhook), `signer` (OutLayer TEE custody + FakeSigner), agent
+orchestration, api skeleton, approvals inbox, policy manifest + drift, PingPay
+invoices. 138 tests.
+Not started: x402/MPP agent payouts, Postgres persistence, web UI.

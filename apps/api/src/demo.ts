@@ -4,14 +4,16 @@
  * credentials. Run with `npm run demo`.
  */
 import type { AddressInfo } from "node:net";
-import { FakeRail } from "@crewpay/rails";
+import { FakeRail, FakePingPay } from "@crewpay/rails";
 import { FakeSigner } from "@crewpay/signer";
 import { defaultRules } from "@crewpay/domain";
 import { createApi } from "./server.ts";
 
+const pingpay = new FakePingPay({ webhookSecret: "whsec_demo" });
 const { server } = createApi({
   rail: new FakeRail({ slowOperationIds: ["run_1_op_3"] }),
   signer: new FakeSigner({ needsReviewOperationIds: ["run_1_op_2"] }),
+  pingpay,
 });
 
 await new Promise<void>((resolve) => server.listen(0, resolve));
@@ -87,5 +89,33 @@ const manifest = await (
   await fetch(`${base}/v1/manifest?orgId=org_1&approvers=owner.near&threshold=1`)
 ).json();
 console.log("manifest:", JSON.stringify(manifest, null, 2));
+
+// Invoice flow: bill a customer, then let Ping's webhook settle it into a pay
+// run. The invoice is billed at 1500.00, under the approval threshold.
+const invoice = (await post("/v1/invoices", {
+  orgId: "org_1",
+  customerId: "acme",
+  amount: 150_000,
+  autoPayRun: { payeeId: "ada" },
+})) as Record<string, unknown>;
+console.log("invoice:", JSON.stringify(invoice, null, 2));
+
+const signed = pingpay.signEvent({
+  id: "evt_demo_1",
+  type: "checkout.session.completed",
+  resourceId: invoice["checkoutSessionId"],
+});
+const settled = await (
+  await fetch(`${base}/v1/webhooks/pingpay`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-ping-signature": String(signed.headers.signature),
+      "x-ping-timestamp": String(signed.headers.timestamp),
+    },
+    body: signed.body,
+  })
+).json();
+console.log("invoice settled by webhook:", JSON.stringify(settled, null, 2));
 
 server.close();
