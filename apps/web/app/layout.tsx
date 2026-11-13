@@ -1,14 +1,15 @@
 import type { Metadata } from "next";
-import { Inter, Caveat } from "next/font/google";
+import { Plus_Jakarta_Sans, Caveat } from "next/font/google";
 import "./globals.css";
 
-/* Open Runde is not on Google Fonts. Inter is the first-listed substitute in
-   the style reference and was also detected on the source page, so it carries
-   both display and body here. Caveat is the signature element, used only for
-   handwritten attributions and annotations. */
-const inter = Inter({
+/* Open Runde is not on Google Fonts. Plus Jakarta Sans is the closest
+   geometric, slightly-monoLinear match with real character at display sizes —
+   a better fit than a neutral UI face. Caveat stays the handwritten signature,
+   used only for annotations. */
+const jakarta = Plus_Jakarta_Sans({
   subsets: ["latin"],
-  variable: "--font-inter",
+  weight: ["400", "500", "600", "700"],
+  variable: "--font-jakarta",
   display: "swap",
 });
 
@@ -38,7 +39,7 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body className={`${inter.variable} ${caveat.variable}`}>{children}</body>
+      <body className={`${jakarta.variable} ${caveat.variable}`}>{children}</body>
     </html>
   );
 }

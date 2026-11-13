@@ -74,7 +74,15 @@ function send(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body, (_key, value) =>
     typeof value === "bigint" ? value.toString() : value,
   );
-  res.writeHead(status, { "content-type": "application/json" });
+  res.writeHead(status, {
+    "content-type": "application/json",
+    // The dashboard is served from a different origin than this API. These
+    // handlers have no auth yet, so this is dev-grade: once auth lands, the
+    // origin must be pinned and credentials sent explicitly.
+    "access-control-allow-origin": "*",
+    "access-control-allow-headers": "content-type, x-ping-signature, x-ping-timestamp",
+    "access-control-allow-methods": "GET, POST, OPTIONS",
+  });
   res.end(payload);
 }
 
@@ -248,6 +256,19 @@ async function handle(
   const url = new URL(req.url ?? "/", "http://localhost");
   const method = req.method ?? "GET";
 
+  // Browsers preflight a cross-origin JSON POST. Answer it before any routing
+  // so the dashboard can call the API from another origin.
+  if (method === "OPTIONS") {
+    res.writeHead(204, {
+      "access-control-allow-origin": "*",
+      "access-control-allow-headers": "content-type, x-ping-signature, x-ping-timestamp",
+      "access-control-allow-methods": "GET, POST, OPTIONS",
+      "access-control-max-age": "86400",
+    });
+    res.end();
+    return;
+  }
+
   if (method === "GET" && url.pathname === "/health") {
     return send(res, 200, { ok: true, rail: deps.rail.name });
   }
@@ -257,6 +278,12 @@ async function handle(
     store.payees.set(body.id, body);
     if (!store.payeeHistory.has(body.id)) store.payeeHistory.set(body.id, 0);
     return send(res, 201, body);
+  }
+
+  if (method === "GET" && url.pathname === "/v1/payees") {
+    const orgId = url.searchParams.get("orgId");
+    const all = [...store.payees.values()].filter((p) => !orgId || p.orgId === orgId);
+    return send(res, 200, all);
   }
 
   if (method === "POST" && url.pathname === "/v1/policies") {
@@ -280,11 +307,37 @@ async function handle(
     return send(res, 201, policy);
   }
 
+  if (method === "GET" && url.pathname === "/v1/policies") {
+    const orgId = url.searchParams.get("orgId");
+    if (!orgId) return send(res, 400, { error: "orgId is required" });
+    // The active policy only: superseded versions exist to make past decisions
+    // replayable, not to be edited.
+    const policy = activePolicy(store, orgId);
+    if (!policy) return send(res, 404, { error: "no active policy for org" });
+    return send(res, 200, policy);
+  }
+
   if (method === "POST" && url.pathname === "/v1/pay-runs") {
     const body = (await readJson(req)) as PayRunRequest;
     const result = await createPayRun(store, deps, body);
     if ("error" in result) return send(res, 400, result);
     return send(res, 201, result);
+  }
+
+  if (method === "GET" && url.pathname === "/v1/pay-runs") {
+    const orgId = url.searchParams.get("orgId");
+    // Newest first, each run carrying its lines so a caller can render progress
+    // without a second request per run. Ties on createdAt (two runs created in
+    // the same millisecond) break on insertion order, newest last-inserted
+    // first, so the order is deterministic rather than left to the Map.
+    const runs = [...store.payRuns.entries()]
+      .filter(([, r]) => !orgId || r.orgId === orgId)
+      .map(([id, run], index) => ({ run, id, index }))
+      .sort((a, b) =>
+        b.run.createdAt.localeCompare(a.run.createdAt) || b.index - a.index,
+      )
+      .map(({ run, id }) => ({ ...run, id, items: store.payRunItems.get(id) ?? [] }));
+    return send(res, 200, runs);
   }
 
   if (method === "POST" && url.pathname === "/v1/invoices") {
@@ -329,6 +382,14 @@ async function handle(
       });
     }
     return send(res, 201, invoice);
+  }
+
+  if (method === "GET" && url.pathname === "/v1/invoices") {
+    const orgId = url.searchParams.get("orgId");
+    const all = [...store.invoices.values()]
+      .filter((i) => !orgId || i.orgId === orgId)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    return send(res, 200, all);
   }
 
   if (method === "POST" && url.pathname === "/v1/webhooks/pingpay") {

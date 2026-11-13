@@ -17,6 +17,7 @@
     "test:ledger": "node --test packages/ledger/src/journal.test.ts",
     "test:signer": "node --test packages/signer/src/*.test.ts",
     "demo": "node apps/api/src/demo.ts",
+    "api": "node apps/api/src/serve.ts",
     "verify:tokens": "node scripts/verify-tokens.ts",
     "smoke:live": "node scripts/smoke-live.ts",
     "typecheck": "tsc --noEmit",

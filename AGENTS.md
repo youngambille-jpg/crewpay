@@ -423,8 +423,9 @@ Next.js 16 + React 19, App Router, no other deps. One static route.
     buttons, electric blue `#0098f2`, iris `#6c56fc`, leaf `#5d9c06`.
   - Shape: pill (100px) for all controls, 16px content cards, 20px images,
     32px large panels. No radius below 10px on anything interactive.
-  - Type: **Inter** as the Open Runde substitute (weight 600 display, 500 body,
-    -0.03em tracking at 20px+), **Caveat** for handwritten annotations only.
+  - Type: **Plus Jakarta Sans** as the Open Runde substitute (weight 600–700
+  display, 500 body, -0.03em tracking at 20px+), **Caveat** for handwritten
+  annotations only. Chosen over a neutral UI face for its geometric character.
   - Tokens live in `app/globals.css` under `:root`; the reference's full token
     block is mirrored there.
 - **Sections**: pill nav → hero with a layered paper-invoice stack → stats →
@@ -453,6 +454,40 @@ The page sells a real product, so the copy is constrained by what is true:
   unknown funding stops instead of retrying, and a confirmed deposit is not a
   paid payee.
 - Keep the palette discipline: at most two chromatic accents on any one screen.
+
+## Dashboard (`apps/web/app/app`)
+
+The product UI, not a marketing page. **Functional focus**: tables, tiles,
+status pills and inline actions. Prose is limited to one `page-note` per screen
+explaining the invariant a reader could otherwise get wrong. If a fact belongs
+on the landing page, it does not belong here.
+
+- **It reads the live API, never fixtures.** Every page fetches the real
+  endpoints in `lib/api.ts`. Server components call the API process directly
+  (`API_ORIGIN`, default `http://127.0.0.1:4000`); client components go through
+  the `/api/*` rewrite in `next.config.ts` so the browser stays same-origin.
+- **Run both processes**: `npm run api` (seeds `org_1` from `apps/api/src/seed.ts`)
+  and `npm run web`. The web build needs `API_ORIGIN` set if the API is not on
+  4000.
+- **Screens**: Overview (needs-a-human + books + recent runs), Pay runs (+
+  compose), Approvals (approve/reject then execute), Worklist (resolve),
+  Payees (+ add), Invoices (+ issue), Agent tasks (+ pay, 1099 roll-up), Policy
+  (publish a new version + manifest drift), Ledger (trial balance + entries).
+- **Actions are real writes**, not simulations: approve→execute, resolve, create
+  pay run, add payee, create invoice, pay agent task, publish policy. They hit
+  the same handlers the tests cover.
+- **Honesty rules that apply here too**: a fetch failure shows an error banner,
+  never a zero (a zero reads as "nothing wrong"). Status pills have an explicit
+  tone map; an unknown status renders neutral rather than being guessed healthy.
+  Execute is kept separate from approve because execution re-checks current
+  policy — collapsing them would hide that an approval can go stale.
+
+### API endpoints the dashboard relies on (added for it)
+
+`GET /v1/payees`, `GET /v1/pay-runs` (with `items`, newest first),
+`GET /v1/invoices`, `GET /v1/policies` (active policy). Plus CORS headers and an
+`OPTIONS` preflight in `send`/`handle`, which are **dev-grade** (`*`) until auth
+lands — pin the origin when it does.
 
 ## Status
 

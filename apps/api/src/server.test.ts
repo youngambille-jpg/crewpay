@@ -1228,3 +1228,109 @@ test("an agent task's unresolved funding is not resolved through the 1Click rail
     started.server.close();
   }
 });
+
+/* ---- list endpoints: the dashboard reads, so these must exist ---- */
+
+test("payees are listed for an org, and filtered by it", async () => {
+  const started = await start();
+  try {
+    await seedAndRun(started.call);
+    await started.call("/v1/payees", "POST", {
+      id: "other",
+      orgId: "org_2",
+      kind: "vendor",
+      displayName: "Other Co",
+      destination: base("base", "usdc"),
+      address: "0xother",
+      status: "approved",
+      screening: "clear",
+    });
+
+    const all = await started.call("/v1/payees", "GET");
+    assert.equal(all.status, 200);
+    assert.equal((all.json as unknown as unknown[]).length, 2);
+
+    const scoped = await started.call("/v1/payees?orgId=org_1", "GET");
+    assert.equal((scoped.json as unknown as unknown[]).length, 1);
+    assert.equal((scoped.json as unknown as { id: string }[])[0]!.id, "ada");
+  } finally {
+    started.server.close();
+  }
+});
+
+test("pay runs are listed newest first with their lines attached", async () => {
+  const started = await start();
+  try {
+    await seedAndRun(started.call);
+    await started.call("/v1/pay-runs", "POST", {
+      orgId: "org_1",
+      period: "2026-12",
+      lines: [{ payeeId: "ada", usdCents: 1_000 }],
+    });
+
+    const res = await started.call("/v1/pay-runs?orgId=org_1", "GET");
+    assert.equal(res.status, 200);
+    const runs = res.json as unknown as { id: string; items: unknown[] }[];
+    assert.equal(runs.length, 2);
+    // Newest first: the second run was created last.
+    assert.equal(runs[0]!.id, "run_2");
+    assert.equal(runs[0]!.items.length, 1);
+    assert.equal(runs[1]!.items.length, 1);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("a pay run list for an unknown org is empty, not an error", async () => {
+  const started = await start();
+  try {
+    await seedAndRun(started.call);
+    const res = await started.call("/v1/pay-runs?orgId=nobody", "GET");
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.json, []);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("invoices are listed for an org", async () => {
+  const started = await start({ pingpay: new FakePingPay({ webhookSecret: "whsec_test" }) });
+  try {
+    await started.call("/v1/invoices", "POST", {
+      orgId: "org_1",
+      customerId: "acme",
+      amount: 150_000,
+    });
+    const res = await started.call("/v1/invoices?orgId=org_1", "GET");
+    assert.equal(res.status, 200);
+    const rows = res.json as unknown as { id: string; status: string }[];
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]!.status, "open");
+  } finally {
+    started.server.close();
+  }
+});
+
+test("the API answers a CORS preflight so a browser dashboard can call it", async () => {
+  const started = await start();
+  try {
+    const res = await fetch(`http://127.0.0.1:${(started.server.address() as AddressInfo).port}/v1/payees`, {
+      method: "OPTIONS",
+    });
+    assert.equal(res.status, 204);
+    assert.equal(res.headers.get("access-control-allow-origin"), "*");
+    assert.match(res.headers.get("access-control-allow-methods") ?? "", /POST/);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("GET responses carry the CORS origin header", async () => {
+  const started = await start();
+  try {
+    const res = await fetch(`http://127.0.0.1:${(started.server.address() as AddressInfo).port}/health`);
+    assert.equal(res.headers.get("access-control-allow-origin"), "*");
+  } finally {
+    started.server.close();
+  }
+});

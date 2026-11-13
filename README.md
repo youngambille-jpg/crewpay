@@ -64,10 +64,10 @@ no network and no credentials, so it is reviewable before any rail is wired in.
 | `packages/rails` | **done** | 52 | `SettlementRail` + `FakeRail`, 1Click adapter, PingPay checkout/webhook, Agent Pay (x402 + MPP) |
 | `packages/signer` | **done** | 45 | OutLayer TEE custody, manifest compile + drift, four-way funding outcome |
 | `apps/agent` | **done** | 26 | Orchestrator: pay runs and per-task agent payouts |
-| `apps/api` | **done** | 39 | Control plane over `node:http`, in-memory store |
-| `apps/web` | **done** | — | Marketing landing page (Next.js 16 + React 19, static) |
+| `apps/api` | **done** | 45 | Control plane over `node:http`, in-memory store |
+| `apps/web` | **done** | — | Landing page + operator dashboard (Next.js 16 + React 19) |
 
-**215 tests, `tsc` clean.**
+**221 tests, `tsc` clean.**
 
 ## The three money flows
 
@@ -153,19 +153,36 @@ No build step and no runtime dependencies are needed for the core packages.
 
 ```bash
 npm install        # links the workspace packages
-npm test           # 215 tests across policy, ledger, rails, signer, agent and api
+npm test           # 221 tests across policy, ledger, rails, signer, agent and api
 npm run demo       # end-to-end pay run against the FakeRail + FakeSigner
+npm run api        # serve the control plane + a seeded org on http://localhost:4000
 npm run test:signer    # signer outcome, manifest and idempotency tests only
 npm run verify:tokens  # check the pinned asset table against live 1Click
 npm run smoke:live     # run the real rails against live services (needs network)
 npm run typecheck  # strict tsc, no emit
-npm run web        # landing page (Next.js) on http://localhost:3000
-npm run web:build  # production build of the landing page
+npm run web        # landing page + dashboard (Next.js) on http://localhost:3000
+npm run web:build  # production build of the web app
 ```
 
-`apps/web` is the marketing landing page (Next.js 16 + React 19). It is the only
-component with a build step and the only one with runtime dependencies; the core
-money packages stay dependency-free and are untouched by it.
+`apps/web` is the marketing landing page **and the operator dashboard**
+(Next.js 16 + React 19). It is the only component with a build step and the only
+one with runtime dependencies; the core money packages stay dependency-free and
+are untouched by it.
+
+The dashboard (`/app`) is a real client of the API, not a mock: it reads pay
+runs, approvals, the funding worklist, payees, invoices, agent tasks, the policy
+and the ledger, and its buttons perform real writes (approve → execute, resolve,
+create a pay run, issue an invoice, pay an agent task, publish a policy). To use
+it, run both processes:
+
+```
+npm run api        # control plane on :4000, seeds org_1
+npm run web        # web app on :3000, proxies /api/* to the API
+```
+
+Then open <http://localhost:3000/app>. The seed is shaped so every policy
+outcome appears at least once — a settled contractor, a held vendor, a denied
+agent — so no screen is empty. Set `API_ORIGIN` if the API is not on port 4000.
 
 `smoke:live` is the one command here that touches the network, so it is
 deliberately not part of `npm test`. It asserts that our parsers accept what the
