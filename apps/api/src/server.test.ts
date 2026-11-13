@@ -1035,3 +1035,196 @@ test("re-reading an unknown request is a 404, not an invented row", async () => 
     started.server.close();
   }
 });
+
+// --- Resolving a funding request into the books -----------------------------
+
+test("a confirmed deposit that the rail settled posts exactly one journal", async () => {
+  // The whole point of the loop: the deposit landing is not the payee being
+  // paid. Only the rail settling closes it, and it must post once.
+  const signer = new FakeSigner({
+    needsReviewOperationIds: ["run_1_op_1"],
+    requestStates: { req_run_1_op_1: { status: "success", txHash: "0xdeposited" } },
+  });
+  const started = await start({ signer });
+  try {
+    await seedAndRun(started.call, { usdCents: 150_000 });
+    assert.equal(started.store.fundingRequests.size, 1);
+
+    const before = started.store.journalEntries.length;
+    const res = await started.call("/v1/custody/requests/req_run_1_op_1/resolve", "POST");
+    assert.equal(res.status, 200);
+    assert.equal(res.json["resolved"], true);
+    assert.equal(res.json["outcome"], "settled");
+    assert.equal(started.store.journalEntries.length, before + 1, "the settlement is booked once");
+
+    // The books must still balance, and the entry must be the settlement.
+    const entry = started.store.journalEntries[started.store.journalEntries.length - 1]!;
+    assert.equal(entry.kind, "payment_settled");
+    const tb = await started.call("/v1/ledger?orgId=org_1", "GET");
+    assert.equal(tb.status, 200);
+
+    // Resolved, so it leaves the worklist.
+    const list = await started.call("/v1/custody/requests?orgId=org_1", "GET");
+    assert.equal((list.json as unknown as unknown[]).length, 0);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("resolving twice does not post a second settlement", async () => {
+  // A caller retrying after a lost response must not double-book the money.
+  const signer = new FakeSigner({
+    needsReviewOperationIds: ["run_1_op_1"],
+    requestStates: { req_run_1_op_1: { status: "success" } },
+  });
+  const started = await start({ signer });
+  try {
+    await seedAndRun(started.call, { usdCents: 150_000 });
+    await started.call("/v1/custody/requests/req_run_1_op_1/resolve", "POST");
+    const afterFirst = started.store.journalEntries.length;
+
+    const again = await started.call("/v1/custody/requests/req_run_1_op_1/resolve", "POST");
+    assert.equal(again.status, 200);
+    assert.equal(again.json["duplicate"], true);
+    assert.equal(started.store.journalEntries.length, afterFirst, "no second posting");
+  } finally {
+    started.server.close();
+  }
+});
+
+test("a deposit confirmed but not yet settled stays open and posts nothing", async () => {
+  // The trap this guards: `success` means the deposit reached the rail. If the
+  // rail has not settled, the payee is not paid and there is nothing to book.
+  const signer = new FakeSigner({
+    needsReviewOperationIds: ["run_1_op_1"],
+    requestStates: { req_run_1_op_1: { status: "success" } },
+  });
+  const started = await start({
+    signer,
+    pollStates: { run_1_op_1: { operationId: "run_1_op_1", status: "pending" } },
+  });
+  try {
+    await seedAndRun(started.call, { usdCents: 150_000 });
+    const before = started.store.journalEntries.length;
+    const res = await started.call("/v1/custody/requests/req_run_1_op_1/resolve", "POST");
+    assert.equal(res.status, 200);
+    assert.equal(res.json["resolved"], false);
+    assert.equal(res.json["outcome"], "open");
+    assert.equal(started.store.journalEntries.length, before, "nothing booked while unsettled");
+
+    // Still on the worklist: the question is unanswered.
+    const list = await started.call("/v1/custody/requests?orgId=org_1", "GET");
+    assert.equal((list.json as unknown as unknown[]).length, 1);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("a refunded deposit closes as failed and books nothing", async () => {
+  // `refunded` means the funds are provably back, so the question is answered.
+  const signer = new FakeSigner({
+    needsReviewOperationIds: ["run_1_op_1"],
+    requestStates: { req_run_1_op_1: { status: "refunded", reason: "bridge refunded" } },
+  });
+  const started = await start({ signer });
+  try {
+    await seedAndRun(started.call, { usdCents: 150_000 });
+    const before = started.store.journalEntries.length;
+    const res = await started.call("/v1/custody/requests/req_run_1_op_1/resolve", "POST");
+    assert.equal(res.json["outcome"], "failed");
+    assert.equal(res.json["reason"], "bridge refunded");
+    assert.equal(started.store.journalEntries.length, before, "a refund is not a settlement");
+    const list = await started.call("/v1/custody/requests?orgId=org_1", "GET");
+    assert.equal((list.json as unknown as unknown[]).length, 0, "answered, so off the worklist");
+  } finally {
+    started.server.close();
+  }
+});
+
+test("a bare funding failure stays open: the funds may have moved", async () => {
+  // The service only proves funds did not move when it says so. A plain
+  // `failed` does not, so closing it would drop the only handle to the money.
+  const signer = new FakeSigner({
+    needsReviewOperationIds: ["run_1_op_1"],
+    requestStates: { req_run_1_op_1: { status: "failed" } },
+  });
+  const started = await start({ signer });
+  try {
+    await seedAndRun(started.call, { usdCents: 150_000 });
+    const res = await started.call("/v1/custody/requests/req_run_1_op_1/resolve", "POST");
+    assert.equal(res.json["resolved"], false);
+    assert.equal(res.json["outcome"], "open");
+    const list = await started.call("/v1/custody/requests?orgId=org_1", "GET");
+    assert.equal((list.json as unknown as unknown[]).length, 1, "still needs a human");
+  } finally {
+    started.server.close();
+  }
+});
+
+test("a still-unknown fund state stays open", async () => {
+  const signer = new FakeSigner({
+    needsReviewOperationIds: ["run_1_op_1"],
+    requestStates: { req_run_1_op_1: { status: "needs_review", reason: "bridge unclear" } },
+  });
+  const started = await start({ signer });
+  try {
+    await seedAndRun(started.call, { usdCents: 150_000 });
+    const res = await started.call("/v1/custody/requests/req_run_1_op_1/resolve", "POST");
+    assert.equal(res.json["outcome"], "open");
+    assert.equal(res.json["reason"], "bridge unclear");
+  } finally {
+    started.server.close();
+  }
+});
+
+test("resolve refuses a retry and never re-submits the funding", async () => {
+  const signer = new FakeSigner({
+    needsReviewOperationIds: ["run_1_op_1"],
+    requestStates: { req_run_1_op_1: { status: "success" } },
+  });
+  const started = await start({ signer });
+  try {
+    await seedAndRun(started.call, { usdCents: 150_000 });
+    const before = started.store.journalEntries.length;
+    const res = await started.call("/v1/custody/requests/req_run_1_op_1/resolve?retry=true", "POST");
+    assert.equal(res.status, 400);
+    assert.equal(started.store.journalEntries.length, before, "nothing happened");
+  } finally {
+    started.server.close();
+  }
+});
+
+test("resolving an unknown request is a 404", async () => {
+  const started = await start({ signer: new FakeSigner() });
+  try {
+    const res = await started.call("/v1/custody/requests/req_nope/resolve", "POST");
+    assert.equal(res.status, 404);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("an agent task's unresolved funding is not resolved through the 1Click rail", async () => {
+  // An agent payout settles through the x402 facilitator. Asking the 1Click
+  // rail about that deposit address would answer about a different deposit, so
+  // a confirmed deposit must stay open rather than be booked from the wrong
+  // service.
+  const signer = new FakeSigner({
+    needsReviewOperationIds: ["op_task_t1"],
+    requestStates: { req_op_task_t1: { status: "success" } },
+  });
+  const started = await start({ agentpay: agentApi(), signer });
+  try {
+    await seedAgent(started);
+    await started.call("/v1/agent-tasks", "POST", agentTask({ id: "t1" }));
+    const record = [...started.store.fundingRequests.values()][0]!;
+    assert.equal(record.settlesVia, "agentpay");
+
+    const before = started.store.journalEntries.length;
+    const res = await started.call(`/v1/custody/requests/${record.requestId}/resolve`, "POST");
+    assert.equal(res.json["outcome"], "open");
+    assert.equal(started.store.journalEntries.length, before, "not booked from the wrong rail");
+  } finally {
+    started.server.close();
+  }
+});

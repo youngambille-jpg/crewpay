@@ -1,7 +1,7 @@
 import type { Approval, Operation, PayRunItem, Payee, Policy } from "@crewpay/domain";
 import { type DecisionResult, evaluate, type DecisionContext } from "@crewpay/policy";
 import { paymentSettled, type JournalEntry } from "@crewpay/ledger";
-import type { SettlementRail, DepositProof, SettlementStatus, SettlementResult } from "@crewpay/rails";
+import type { SettlementRail, DepositProof, Quote, SettlementStatus, SettlementResult } from "@crewpay/rails";
 import type { FundingOutcome, Signer } from "@crewpay/signer";
 
 /** How many times to poll a rail before giving up on an in-flight settlement. */
@@ -20,6 +20,11 @@ export interface OperationOutcome {
   readonly settlement?: SettlementResult;
   /** How funding went, when the operation got as far as the signer. */
   readonly funding?: FundingOutcome;
+  /**
+   * The rail quote for this operation's deposit. Kept beside an unresolved
+   * funding so its deposit address is available to re-read the settlement.
+   */
+  readonly quote?: Quote;
   readonly journal?: JournalEntry;
 }
 
@@ -48,6 +53,11 @@ export interface RunDeps {
  * carries the journal entry; the rest say what a caller must do next. The
  * funding detail travels with every variant so the caller can record the
  * deposit proof, or the reason funding did not complete.
+ *
+ * `quote` travels too, and it is not decoration: the deposit address inside it
+ * is the only key the rail answers a settlement status for. An unresolved
+ * funding keeps the request id; without the quote beside it we could later
+ * confirm the deposit landed but never learn whether the payee was paid.
  */
 export type SettlementOutcome =
   | {
@@ -55,9 +65,20 @@ export type SettlementOutcome =
       readonly settlement: SettlementResult;
       readonly journal: JournalEntry;
       readonly funding?: FundingOutcome;
+      readonly quote?: Quote;
     }
-  | { readonly kind: "failed"; readonly settlement?: SettlementResult; readonly funding?: FundingOutcome }
-  | { readonly kind: "needs_review"; readonly settlement?: SettlementResult; readonly funding?: FundingOutcome };
+  | {
+      readonly kind: "failed";
+      readonly settlement?: SettlementResult;
+      readonly funding?: FundingOutcome;
+      readonly quote?: Quote;
+    }
+  | {
+      readonly kind: "needs_review";
+      readonly settlement?: SettlementResult;
+      readonly funding?: FundingOutcome;
+      readonly quote?: Quote;
+    };
 
 /**
  * Move one already-authorised operation: quote, fund the deposit, submit, then
@@ -81,10 +102,10 @@ export async function settleOperation(
     const plan = deps.signer.plan(operation, quote);
     const funding = await deps.signer.fund(operation, quote, plan);
     if (funding.kind === "needs_review" || funding.kind === "pending") {
-      return { kind: "needs_review", funding };
+      return { kind: "needs_review", funding, quote };
     }
     if (funding.kind === "failed") {
-      return { kind: "failed", funding };
+      return { kind: "failed", funding, quote };
     }
     proof = funding.proof;
     funded = funding;
@@ -104,15 +125,15 @@ export async function settleOperation(
       currency: operation.destination.asset,
       memo: `${operation.type} ${operation.id} settled`,
     });
-    return { kind: "settled", settlement, journal, ...(funded ? { funding: funded } : {}) };
+    return { kind: "settled", settlement, journal, quote, ...(funded ? { funding: funded } : {}) };
   }
 
   if (settlement.status === "failed" || settlement.status === "refunded") {
-    return { kind: "failed", settlement, ...(funded ? { funding: funded } : {}) };
+    return { kind: "failed", settlement, quote, ...(funded ? { funding: funded } : {}) };
   }
 
   // Still in flight after the poll budget: not a failure, needs attention.
-  return { kind: "needs_review", settlement, ...(funded ? { funding: funded } : {}) };
+  return { kind: "needs_review", settlement, quote, ...(funded ? { funding: funded } : {}) };
 }
 
 /**
@@ -170,6 +191,7 @@ export async function executeRun(
         settlement: result.settlement,
         journal: result.journal,
         ...(result.funding ? { funding: result.funding } : {}),
+        ...(result.quote ? { quote: result.quote } : {}),
       });
     } else if (result.kind === "failed") {
       failed.push(operation.id);
@@ -179,6 +201,7 @@ export async function executeRun(
         decision,
         ...(result.settlement ? { settlement: result.settlement } : {}),
         ...(result.funding ? { funding: result.funding } : {}),
+        ...(result.quote ? { quote: result.quote } : {}),
       });
     } else {
       needsReview.push(operation.id);
@@ -188,6 +211,7 @@ export async function executeRun(
         decision,
         ...(result.settlement ? { settlement: result.settlement } : {}),
         ...(result.funding ? { funding: result.funding } : {}),
+        ...(result.quote ? { quote: result.quote } : {}),
       });
     }
   }
@@ -214,6 +238,8 @@ export interface ExecuteApprovedResult {
    * learn later whether the money moved.
    */
   readonly funding?: FundingOutcome;
+  /** The rail quote for the deposit; the key for a later settlement re-read. */
+  readonly quote?: Quote;
 }
 
 /**
@@ -254,6 +280,7 @@ export async function executeApproved(
       approval: { ...approval, status: "executed" },
       journal: result.journal,
       ...(result.funding ? { funding: result.funding } : {}),
+      ...(result.quote ? { quote: result.quote } : {}),
     };
   }
   if (result.kind === "failed") {
@@ -266,11 +293,13 @@ export async function executeApproved(
         ...(result.settlement?.failureReason ? { note: result.settlement.failureReason } : {}),
       },
       ...(result.funding ? { funding: result.funding } : {}),
+      ...(result.quote ? { quote: result.quote } : {}),
     };
   }
   return {
     status: "needs_review",
     approval: { ...approval, status: "executing" },
     ...(result.funding ? { funding: result.funding } : {}),
+    ...(result.quote ? { quote: result.quote } : {}),
   };
 }

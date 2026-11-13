@@ -18,9 +18,9 @@ import { defaultRules, corridor, invoiceStatusFor } from "@crewpay/domain";
 import type { AgentPayPort, PingPayPort, SettlementRail } from "@crewpay/rails";
 import type { Signer } from "@crewpay/signer";
 import { compileManifest, diffManifest, type ManifestDrift } from "@crewpay/signer";
-import { executeApproved, executeRun, payAgentTask } from "@crewpay/agent";
+import { executeApproved, executeRun, payAgentTask, resolveFunding } from "@crewpay/agent";
 import { allBalanced, attestation, trialBalance } from "@crewpay/ledger";
-import { activePolicy, createStore, recordFunding, type Store } from "./store.ts";
+import { activePolicy, createStore, recordFunding, resolveFundingRecord, type Store } from "./store.ts";
 
 export interface ApiDeps {
   readonly rail: SettlementRail;
@@ -147,8 +147,18 @@ async function createPayRun(
     // not record is money the export cannot show.
     if (outcome.journal) store.journalEntries.push(outcome.journal);
     // Keep any funding we could not resolve: the request id is the only handle
-    // that can tell us later whether that money moved.
-    recordFunding(store, { orgId: body.orgId, operationId: outcome.operationId }, outcome.funding);
+    // that can tell us later whether that money moved. The quote rides along so
+    // a later resolve can ask the rail whether the payee was actually paid.
+    recordFunding(
+      store,
+      {
+        orgId: body.orgId,
+        operationId: outcome.operationId,
+        payeeId: outcome.payeeId,
+        ...(outcome.quote ? { railQuote: outcome.quote } : {}),
+      },
+      outcome.funding,
+    );
   }
   store.settledTodayCents.set(
     body.orgId,
@@ -448,8 +458,12 @@ async function handle(
   if (method === "GET" && url.pathname === "/v1/custody/requests") {
     // The worklist: funding requests we could not resolve. These are the ones
     // where funds may have moved and the outcome we recorded is only a snapshot.
+    // Resolved records are filtered out — the list exists to show what still
+    // needs a human, and an answered question does not.
     const orgId = url.searchParams.get("orgId");
-    const rows = [...store.fundingRequests.values()].filter((r) => !orgId || r.orgId === orgId);
+    const rows = [...store.fundingRequests.values()].filter(
+      (r) => !r.resolution && (!orgId || r.orgId === orgId),
+    );
     return send(res, 200, rows);
   }
 
@@ -465,6 +479,87 @@ async function handle(
     }
     const state = await deps.signer.reconcile(requestId);
     return send(res, 200, { record, state });
+  }
+
+  const resolveMatch = /^\/v1\/custody\/requests\/([^/]+)\/resolve$/.exec(url.pathname);
+  if (method === "POST" && resolveMatch) {
+    const requestId = decodeURIComponent(resolveMatch[1]!);
+    const record = store.fundingRequests.get(requestId);
+    if (!record) return send(res, 404, { error: "unknown funding request" });
+    if (!deps.signer?.reconcile) {
+      return send(res, 400, { error: "no reconciling signer configured", record });
+    }
+
+    // The endpoint may only re-read: an unresolved funding is one where a
+    // second submit could send the money twice. A query flag that asked for a
+    // retry is refused rather than quietly ignored, so no caller believes a
+    // payment was re-driven when it was not.
+    if (url.searchParams.get("retry") === "true") {
+      return send(res, 400, {
+        error:
+          "resolve never re-submits a funding request; the funds may already have moved",
+        record,
+      });
+    }
+
+    // Already answered: report the same answer rather than re-deciding. This is
+    // what makes a retry after a lost response safe.
+    if (record.resolution) {
+      return send(res, 200, {
+        resolved: true,
+        outcome: record.resolution,
+        duplicate: true,
+        reason: record.resolutionNote,
+      });
+    }
+
+    const operation = store.operations.get(record.operationId);
+    const outcome = await resolveFunding({
+      signer: deps.signer,
+      // An agent task settles through the x402 facilitator, not the 1Click
+      // rail. Asking the wrong service would answer about a different deposit.
+      ...(record.settlesVia === "agentpay" ? {} : { rail: deps.rail }),
+      ...(record.settlesVia ? { settlesVia: record.settlesVia } : {}),
+      requestId,
+      ...(operation ? { operation } : {}),
+      ...(record.railQuote ? { railQuote: record.railQuote } : {}),
+    });
+
+    if (outcome.kind === "open") {
+      // Still unanswered. Update what we know, but keep it on the worklist.
+      store.fundingRequests.set(requestId, { ...record, reason: outcome.reason });
+      return send(res, 200, { resolved: false, outcome: "open", reason: outcome.reason, record });
+    }
+
+    if (outcome.kind === "settled") {
+      // Only now is the payee paid, so only now may the books record it. Guard
+      // on the entry id so a second resolve is a no-op, not a second posting.
+      const already = store.journalEntries.some((e) => e.id === outcome.journal.id);
+      if (!already) {
+        store.journalEntries.push(outcome.journal);
+        if (record.payeeId) {
+          store.payeeHistory.set(record.payeeId, (store.payeeHistory.get(record.payeeId) ?? 0) + 1);
+        }
+      }
+      resolveFundingRecord(store, requestId, "settled");
+      return send(res, 200, {
+        resolved: true,
+        outcome: "settled",
+        journal: outcome.journal,
+        deposit: outcome.deposit,
+        duplicate: already,
+      });
+    }
+
+    // Terminal failure: the money is accounted for (refunded, never sent, or a
+    // rail that will not complete), so the question is answered.
+    resolveFundingRecord(store, requestId, "failed", outcome.reason);
+    return send(res, 200, {
+      resolved: true,
+      outcome: "failed",
+      reason: outcome.reason,
+      deposit: outcome.deposit,
+    });
   }
 
   if (method === "GET" && url.pathname === "/v1/approvals") {
@@ -518,10 +613,16 @@ async function handle(
 
     store.approvals.set(approval.id, result.approval);
     // Record the funding handle whether the operation executed or not: a
-    // failed or unresolved funding is exactly the case that must be kept.
+    // failed or unresolved funding is exactly the case that must be kept. The
+    // quote travels with it so a later resolve can ask the rail for the truth.
     recordFunding(
       store,
-      { orgId: approval.orgId, operationId: approval.operationId },
+      {
+        orgId: approval.orgId,
+        operationId: approval.operationId,
+        payeeId: approval.payeeId,
+        ...(result.quote ? { railQuote: result.quote } : {}),
+      },
       result.funding,
     );
     if (result.status === "executed") {
@@ -596,10 +697,12 @@ async function handle(
     };
     store.agentTasks.set(task.id, updated);
 
-    // Keep the funding handle when the payout did not fully resolve.
+    // Keep the funding handle when the payout did not fully resolve. An agent
+    // task settles through the x402 facilitator, so the record says so — the
+    // 1Click rail knows nothing about this deposit address.
     recordFunding(
       store,
-      { orgId: task.orgId, operationId: task.id },
+      { orgId: task.orgId, operationId: task.id, payeeId: task.payeeId, settlesVia: "agentpay" },
       "funding" in outcome ? outcome.funding : undefined,
     );
 

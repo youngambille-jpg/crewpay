@@ -192,6 +192,7 @@ GET    /v1/manifest                    compile the policy to an OutLayer manifes
 GET    /v1/custody/approvals           mirror the wallet's own multisig inbox
 GET    /v1/custody/requests            unresolved funding requests (?orgId=)
 GET    /v1/custody/requests/:id        re-read one request's true state (read-only)
+POST   /v1/custody/requests/:id/resolve  settle the loop: re-read, book only a real settlement
 POST   /v1/invoices                    issue an invoice (PingPay checkout)
 GET    /v1/invoices                    invoices (?orgId=)
 POST   /v1/webhooks/pingpay            payment settled -> trigger pay run / reconcile
@@ -234,11 +235,24 @@ webhook either — swap status is tracked with `GET /v0/status`. Polling is the
 documented path at both levels.
 
 So the reconciliation work went the safe way instead: `/v1/custody/requests`
-keeps every unresolved funding request, and `/v1/custody/requests/:id` re-reads
-the service's own row. That is pull-based, uses the documented `GET
-/wallet/v1/requests/{id}`, and needs no assumption about a signature. A webhook
+keeps every unresolved funding request, `/v1/custody/requests/:id` re-reads
+the service's own row, and `POST /v1/custody/requests/:id/resolve` closes the
+loop into the books. All three are pull-based, use the documented `GET
+/wallet/v1/requests/{id}`, and need no assumption about a signature. A webhook
 is an optimisation on top of this — it can be added once the signing contract is
 confirmed, without changing the reconciliation model.
+
+The subtlety the resolve step exists for: an OutLayer funding `success` means
+the *deposit reached the rail*, not that the payee was paid. In a pay run an
+unresolved funding returns before the rail is ever submitted, so a deposit can
+land and settle with nobody watching. Booking a settlement on the deposit alone
+would invent money movement. So resolve treats a confirmed deposit only as the
+point at which it starts asking the rail — via the documented `GET /v0/status`
+— whether the payee actually got paid, and writes the journal entry only when
+the rail says `settled`. A bare funding `failed` is not proof the funds stayed
+put, so it stays on the worklist for a human; only `refunded`/`rejected` (funds
+provably back or never sent) close it. Resolve never re-submits: a `?retry=true`
+is refused rather than silently ignored.
 
 ## Design rules
 
@@ -282,6 +296,13 @@ confirmed, without changing the reconciliation model.
     real bug: `interpret()` computed the request id but dropped it on every
     `failed` branch, losing the handle in exactly the case where funds may have
     moved. The re-read is read-only on purpose; it never re-submits.
-12. OutLayer `request_completed` webhook — see "Not built" above: the signing
+12. Close the reconciliation loop into the books — done (`POST
+    /v1/custody/requests/:id/resolve`). A confirmed deposit is not a paid payee,
+    so resolve follows it to the rail and books a settlement only when the rail
+    reports `settled`. The record is marked resolved rather than deleted, so a
+    retry after a lost response is idempotent, and resolved rows leave the
+    worklist. The deposit quote travels with the funding record, because the
+    deposit address inside it is the only key the rail answers a status for.
+13. OutLayer `request_completed` webhook — see "Not built" above: the signing
     contract is underspecified, so this waits on confirmation rather than a
     guess.

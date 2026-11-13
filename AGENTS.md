@@ -379,6 +379,22 @@ suite must stay offline and deterministic. Run it by hand or on a schedule.
   forged "settled" event. Reconciliation is pull-based instead, over the
   documented `GET /wallet/v1/requests/{id}`. Add the webhook when the contract
   is confirmed.
+- **A funding `success` is not a paid payee.** The OutLayer funding request
+  covers moving origin funds to the rail's deposit address; `settleOperation`
+  returns before `rail.submit`/`rail.poll` on an unresolved funding, so a
+  deposit can land and settle with nobody watching. Booking a settlement on the
+  deposit alone would invent money movement. `resolveFunding`
+  (`apps/agent/src/reconcile.ts`) therefore treats a confirmed deposit only as
+  the point at which it polls the rail (documented `GET /v0/status`) and writes
+  the journal entry only on a rail `settled`. Corollary: a bare funding `failed`
+  is *not* proof the funds stayed put — only `refunded`/`rejected` are — so it
+  stays on the worklist. `POST /v1/custody/requests/:id/resolve` is read-only
+  (a `?retry=true` is refused) and marks the record resolved rather than
+  deleting it, so a retry after a lost response is idempotent. The deposit quote
+  must be kept on the funding record: the deposit address inside it is the only
+  key the rail answers a status for. An agent-task funding settles through the
+  x402 facilitator, not the 1Click rail, and is recorded as `settlesVia:
+  "agentpay"` so resolve does not ask the wrong service.
 
 ## Status
 
@@ -386,5 +402,5 @@ Done and tested: `domain`, `policy`, `ledger`, `rails` (incl. 1Click adapter,
 PingPay checkout/webhook, Agent Pay x402 + MPP charge), `signer` (OutLayer TEE
 custody + FakeSigner), agent orchestration (pay run + agent task payouts), api
 skeleton, approvals inbox, policy manifest + drift, PingPay invoices, agent task
-payouts + 1099-style export. 183 tests.
+payouts + 1099-style export, funding reconciliation into the books. 215 tests.
 Not started: Postgres persistence, web UI.

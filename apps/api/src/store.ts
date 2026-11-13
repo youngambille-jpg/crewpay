@@ -1,5 +1,6 @@
 import type { AgentTask, Approval, ChainAsset, Invoice, Operation, PayRun, PayRunItem, Payee, Policy } from "@crewpay/domain";
 import type { JournalEntry } from "@crewpay/ledger";
+import type { Quote } from "@crewpay/rails";
 
 export interface Store {
   payees: Map<string, Payee>;
@@ -38,16 +39,43 @@ export interface Store {
 /**
  * A funding request we are tracking. It records what we believed at the time
  * and when; the service row is the authority, this is the worklist.
+ *
+ * `railQuote` is what makes resolution possible: re-reading tells us the
+ * *deposit* landed, but the deposit address in the quote is the only key the
+ * rail will answer a settlement status for. Without it we could confirm the
+ * money left but never learn whether the payee was paid.
  */
 export interface FundingRecord {
   readonly requestId: string;
   readonly orgId: string;
   readonly operationId: string;
+  /** Who is owed the money, so a late settlement still counts as history. */
+  readonly payeeId?: string;
   /** The outcome kind we recorded, e.g. `needs_review` or `failed`. */
   readonly kind: "pending" | "failed" | "needs_review";
   readonly reason: string;
   /** Present when `kind` is `failed`. */
   readonly safeToRetry?: boolean;
+  /** The rail quote for this deposit, needed to poll for the settlement. */
+  readonly railQuote?: Quote;
+  /**
+   * Which settlement port owns this deposit. A pay run and an approval settle
+   * through the 1Click rail; an agent task settles through the x402 facilitator.
+   * They are different services, so polling the wrong one with this deposit
+   * address would answer about something else. Defaults to `rail`.
+   */
+  readonly settlesVia?: "rail" | "agentpay";
+  /**
+   * Set once the open question is answered. A resolved record is kept rather
+   * than deleted so a repeated resolve is idempotent: the second call can see
+   * the answer and report it instead of 404-ing, which a caller retrying after
+   * a lost response could not distinguish from "never existed". Resolved
+   * records are hidden from the worklist, which is what it is for.
+   */
+  readonly resolution?: "settled" | "failed";
+  readonly resolvedAt?: string;
+  /** What resolving concluded, e.g. the rail's failure reason. */
+  readonly resolutionNote?: string;
   readonly createdAt: string;
 }
 
@@ -91,7 +119,13 @@ export function activePolicy(store: Store, orgId: string): Policy | undefined {
  */
 export function recordFunding(
   store: Store,
-  ctx: { orgId: string; operationId: string },
+  ctx: {
+    orgId: string;
+    operationId: string;
+    payeeId?: string;
+    railQuote?: Quote;
+    settlesVia?: "rail" | "agentpay";
+  },
   funding: { kind: string; reason?: string; safeToRetry?: boolean; requestId?: string } | undefined,
 ): void {
   if (!funding || !funding.requestId) return;
@@ -102,9 +136,36 @@ export function recordFunding(
     requestId: funding.requestId,
     orgId: ctx.orgId,
     operationId: ctx.operationId,
+    ...(ctx.payeeId ? { payeeId: ctx.payeeId } : {}),
     kind: funding.kind as "pending" | "failed" | "needs_review",
     reason: funding.reason ?? "",
     ...(funding.kind === "failed" ? { safeToRetry: funding.safeToRetry ?? false } : {}),
+    ...(ctx.railQuote ? { railQuote: ctx.railQuote } : {}),
+    ...(ctx.settlesVia ? { settlesVia: ctx.settlesVia } : {}),
     createdAt: new Date().toISOString(),
+  });
+}
+
+/**
+ * Record that a funding request's open question is answered.
+ *
+ * The record is marked, not deleted, so a repeated resolve is idempotent: a
+ * caller retrying after a lost response must be able to tell "already resolved"
+ * from "never existed". The worklist filters resolved records out, which is
+ * what it is for — finding the ones that still need a human.
+ */
+export function resolveFundingRecord(
+  store: Store,
+  requestId: string,
+  resolution: "settled" | "failed",
+  note?: string,
+): void {
+  const record = store.fundingRequests.get(requestId);
+  if (!record) return;
+  store.fundingRequests.set(requestId, {
+    ...record,
+    resolution,
+    resolvedAt: new Date().toISOString(),
+    ...(note ? { resolutionNote: note } : {}),
   });
 }

@@ -12,6 +12,13 @@ export interface FakeRailOptions {
   readonly feeBps?: number;
   /** Number of pending polls before a slow operation settles. */
   readonly pendingPolls?: number;
+  /**
+   * An explicit poll result per operation id, for reconciliation tests. Without
+   * it, polling an operation the rail never submitted to still reports settled —
+   * fine for the happy path, but a reconciliation test must be able to say the
+   * rail has *not* settled, or it would pass without exercising that branch.
+   */
+  readonly pollStates?: Readonly<Record<string, SettlementResult>>;
 }
 
 /**
@@ -28,6 +35,7 @@ export class FakeRail implements SettlementRail {
   private readonly refund: ReadonlySet<string>;
   private readonly feeBps: number;
   private readonly pendingPolls: number;
+  private readonly pollStates: Readonly<Record<string, SettlementResult>>;
 
   constructor(options: FakeRailOptions = {}) {
     this.fail = new Set(options.failOperationIds ?? []);
@@ -35,6 +43,7 @@ export class FakeRail implements SettlementRail {
     this.refund = new Set(options.refundOperationIds ?? []);
     this.feeBps = options.feeBps ?? 0;
     this.pendingPolls = options.pendingPolls ?? 1;
+    this.pollStates = options.pollStates ?? {};
   }
 
   async quote(op: Operation): Promise<Quote> {
@@ -70,6 +79,8 @@ export class FakeRail implements SettlementRail {
   }
 
   async poll(operationId: string, quote?: Quote): Promise<SettlementResult> {
+    const explicit = this.pollStates[operationId];
+    if (explicit) return explicit;
     const remaining = this.pending.get(operationId);
     if (remaining !== undefined) {
       if (remaining > 1) {
