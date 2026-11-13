@@ -1,5 +1,6 @@
 import Nav from "@/components/Nav";
-import PayRunTerminal from "@/components/PayRunTerminal";
+import PaperStack from "@/components/PaperStack";
+import { Check, Plus } from "@/components/Icons";
 
 const CAPABILITIES = [
   {
@@ -18,7 +19,7 @@ const CAPABILITIES = [
     num: "03",
     title: "Agent payees",
     body: "An AI agent is a payee like any other. A task becomes an ordinary Operation, so per-kind caps and approvals apply identically.",
-    points: ["Paid per completed task", "x402 / MPP charge", "Same policy gate as payroll"],
+    points: ["Paid per completed task", "x402 charge", "Same policy gate as payroll"],
   },
   {
     num: "04",
@@ -76,12 +77,12 @@ const WHY = [
   },
 ];
 
-const RECEIPTS = [
+const PROOF = [
   {
     k: "Ledger",
     title: "Balanced by construction",
     body: "Every operation produces a signed receipt and a double-entry line. The books are correct by construction and auditable from chain.",
-    code: "GET /v1/ledger → trial balance Σ = 0",
+    code: "GET /v1/ledger → Σ = 0",
   },
   {
     k: "Policy",
@@ -93,11 +94,11 @@ const RECEIPTS = [
     k: "Custody",
     title: "Non-custodial by default",
     body: "CrewPay never holds your funds. Signing happens inside a TEE; this service holds a wallet API key, never a private key.",
-    code: "signer: OutLayer TEE · keys never leave",
+    code: "signer: TEE · keys never leave",
   },
   {
     k: "Reconciliation",
-    title: "A confirmed deposit is not a paid payee",
+    title: "A deposit is not a payment",
     body: "A deposit landing only means funds reached the rail. We follow it to the rail's own status and book a settlement only when the payee is actually paid.",
     code: "POST /v1/custody/requests/:id/resolve",
   },
@@ -120,11 +121,11 @@ const PRICING = [
   {
     name: "Growth",
     price: "0.5%",
-    unit: "per settled volume",
+    unit: "of settled volume",
     featured: true,
     items: [
       "Everything in Starter",
-      "Agent payees (x402 / MPP)",
+      "Agent payees (x402)",
       "PingPay fiat collection",
       "Manifest drift monitoring",
       "1099-style roll-up",
@@ -176,16 +177,16 @@ const FAQ = [
 export default function Home() {
   return (
     <>
+      <span id="top" />
       <Nav />
 
       <main>
-        {/* ---------- hero ---------- */}
+        {/* ============================ hero ============================ */}
         <section className="hero">
-          <div className="hero-glow" aria-hidden />
-          <div className="hero-grid-bg" aria-hidden />
-
           <div className="wrap hero-inner">
-            <span className="eyebrow">Stablecoin payroll · NEAR Intents · x402</span>
+            <span className="eyebrow">
+              Stablecoin payroll · NEAR Intents · x402
+            </span>
 
             <h1 className="display">
               One guarded pay run for your whole workforce
@@ -193,26 +194,47 @@ export default function Home() {
 
             <p className="hero-sub">
               Contractors, vendors and AI agents, paid per task on stablecoins —
-              on their own chain. You set the rules once: caps, allowlists and
-              approval thresholds. The agent can&apos;t exceed them, and every
-              settlement lands in books that actually reconcile.
+              on their own chain. You set the rules once; the agent can&apos;t
+              exceed them.
             </p>
 
-            <div className="hero-cta">
-              <a className="btn btn-primary" href="#cta">
+            <div className="hero-actions">
+              <a className="btn btn-fill" href="#cta">
                 Book a pay run
               </a>
-              <a className="btn" href="#flows">
+              <a className="btn btn-outline" href="#flows">
                 See how it works
               </a>
             </div>
 
-            <span className="hero-note">
-              Non-custodial · no LLM in the money path · live on NEAR Intents + PingPay
-            </span>
+            <div className="rates">
+              <span className="rate">
+                <span className="tick">
+                  <Check size={11} color="#ffffff" />
+                </span>
+                Policy checks <b>every line</b>
+              </span>
+              <span className="rate">
+                <span className="tick">
+                  <Check size={11} color="#ffffff" />
+                </span>
+                Books <b>always balance</b>
+              </span>
+              <span className="rate">
+                <span className="tick">
+                  <Check size={11} color="#ffffff" />
+                </span>
+                Non-custodial <b>by design</b>
+              </span>
+            </div>
 
-            <PayRunTerminal />
+            <PaperStack />
+          </div>
+        </section>
 
+        {/* ============================ stats ============================ */}
+        <section className="section" style={{ paddingTop: 0 }}>
+          <div className="wrap">
             <div className="stats">
               <div className="stat">
                 <b>0</b>
@@ -234,65 +256,84 @@ export default function Home() {
           </div>
         </section>
 
-        {/* ---------- rails ---------- */}
-        <section className="section" id="rails">
+        {/* ============================ large panel ============================ */}
+        <section className="section" id="product">
           <div className="wrap">
-            <div className="section-head">
-              <span className="eyebrow">Built on rails you can verify</span>
-              <h2 className="display">
-                The rails are a commodity. The trust-and-books layer is the product.
-              </h2>
-              <p className="lead">
-                We do not re-implement settlement, custody or onramps. We own the
-                part nobody else does well: the deterministic gate in front of the
-                money, and the books behind it.
-              </p>
-            </div>
+            <div className="panel">
+              <div>
+                <span className="eyebrow">The control layer</span>
+                <h2 style={{ marginTop: 16 }}>
+                  We designed a pay run that cannot overspend itself
+                </h2>
+                <p className="body">
+                  The rails are a commodity. The trust-and-books layer is the
+                  product: a deterministic gate in front of the money, and a
+                  double-entry ledger behind it. Signing happens in a TEE, and
+                  CrewPay never holds your funds.
+                </p>
+              </div>
 
-            <div className="railstrip">
-              <div className="rail">
-                <em>Cross-chain</em>
-                <b>NEAR Intents · 1Click</b>
-                <span>
-                  Signed intents settle cross-chain. Swap status is tracked on the
-                  documented status endpoint, not a guessed webhook.
-                </span>
-              </div>
-              <div className="rail">
-                <em>Fiat + agent paywalls</em>
-                <b>PingPay</b>
-                <span>
-                  Hosted checkout for invoices, signed HMAC webhooks, and the x402
-                  facilitator for agent payouts.
-                </span>
-              </div>
-              <div className="rail">
-                <em>Custody</em>
-                <b>OutLayer TEE</b>
-                <span>
-                  Signing and TEE-enforced policy. We hold a wallet API key, never
-                  a private key.
-                </span>
-              </div>
-              <div className="rail">
-                <em>Ledger</em>
-                <b>CrewPay core</b>
-                <span>
-                  Double-entry journal, balanced-entry enforcement, and a
-                  content-hash attestation over the books.
-                </span>
+              <div className="panel-right">
+                <div className="rate-row">
+                  <span className="l">
+                    <span className="ic" style={{ background: "#6c56fc" }}>
+                      N
+                    </span>
+                    NEAR Intents
+                  </span>
+                  <span className="v">
+                    Cross-chain
+                    <small>settlement</small>
+                  </span>
+                </div>
+                <div className="rate-row">
+                  <span className="l">
+                    <span className="ic" style={{ background: "#0098f2" }}>
+                      P
+                    </span>
+                    PingPay
+                  </span>
+                  <span className="v">
+                    Fiat + x402
+                    <small>collection</small>
+                  </span>
+                </div>
+                <div className="rate-row">
+                  <span className="l">
+                    <span className="ic" style={{ background: "#0d111b" }}>
+                      T
+                    </span>
+                    OutLayer TEE
+                  </span>
+                  <span className="v">
+                    Keys stay
+                    <small>in the TEE</small>
+                  </span>
+                </div>
+                <div className="rate-row">
+                  <span className="l">
+                    <span className="ic" style={{ background: "#5d9c06" }}>
+                      L
+                    </span>
+                    CrewPay ledger
+                  </span>
+                  <span className="v">
+                    Σ = 0
+                    <small>enforced</small>
+                  </span>
+                </div>
               </div>
             </div>
           </div>
         </section>
 
-        {/* ---------- capabilities ---------- */}
-        <section className="section" id="capabilities">
+        {/* ============================ capabilities ============================ */}
+        <section className="section band">
           <div className="wrap">
-            <div className="section-head">
+            <div className="sec-head">
               <span className="eyebrow">Capabilities</span>
               <h2 className="display">What we bring to the table</h2>
-              <p className="lead">
+              <p className="sub">
                 Four things, all of them load-bearing. Everything below is
                 implemented and tested — the money logic runs end to end with no
                 network and no credentials.
@@ -316,16 +357,16 @@ export default function Home() {
           </div>
         </section>
 
-        {/* ---------- flows ---------- */}
+        {/* ============================ flows ============================ */}
         <section className="section" id="flows">
           <div className="wrap">
-            <div className="section-head">
+            <div className="sec-head">
               <span className="eyebrow">Three money flows</span>
               <h2 className="display">One policy path, three ways in</h2>
-              <p className="lead">
+              <p className="sub">
                 Payroll, an invoice you collected, and a task an agent completed
-                all converge on the same gate. That is the whole design: one place
-                where money is allowed, one place where it is recorded.
+                all converge on the same gate. That is the whole design: one
+                place where money is allowed, one place where it is recorded.
               </p>
             </div>
 
@@ -336,7 +377,7 @@ export default function Home() {
                   <ol>
                     {f.steps.map((s, i) => (
                       <li key={s}>
-                        <b>{String(i + 1).padStart(2, "0")}</b>
+                        <b>{i + 1}</b>
                         <span>{s}</span>
                       </li>
                     ))}
@@ -347,10 +388,10 @@ export default function Home() {
           </div>
         </section>
 
-        {/* ---------- why ---------- */}
-        <section className="section" id="why">
+        {/* ============================ why ============================ */}
+        <section className="section band" id="why">
           <div className="wrap">
-            <div className="section-head">
+            <div className="sec-head">
               <span className="eyebrow">Why teams stick with us</span>
               <h2 className="display">Guardrails you can point at</h2>
             </div>
@@ -366,59 +407,67 @@ export default function Home() {
           </div>
         </section>
 
-        {/* ---------- receipts ---------- */}
-        <section className="section" id="receipts">
+        {/* ============================ proof ============================ */}
+        <section className="section">
           <div className="wrap">
-            <div className="section-head">
+            <div className="sec-head">
               <span className="eyebrow">Stuff we&apos;re proud of</span>
               <h2 className="display">Proof, not promises</h2>
-              <p className="lead">
-                Each of these is an endpoint you can call, not a claim on a slide.
+              <p className="sub">
+                Each of these is an endpoint you can call, not a claim on a
+                slide.
               </p>
             </div>
 
-            <div className="receipts">
-              {RECEIPTS.map((r) => (
-                <div className="receipt" key={r.k}>
-                  <span className="k">{r.k}</span>
-                  <b>{r.title}</b>
-                  <p>{r.body}</p>
-                  <code>{r.code}</code>
+            <div className="proof">
+              {PROOF.map((p) => (
+                <div className="proof-card" key={p.k}>
+                  <span className="k">{p.k}</span>
+                  <b>{p.title}</b>
+                  <p>{p.body}</p>
+                  <code>{p.code}</code>
                 </div>
               ))}
             </div>
           </div>
         </section>
 
-        {/* ---------- pricing ---------- */}
-        <section className="section" id="pricing">
+        {/* ============================ pricing ============================ */}
+        <section className="section band" id="pricing">
           <div className="wrap">
-            <div className="section-head">
+            <div className="sec-head">
               <span className="eyebrow">Pricing</span>
               <h2 className="display">Invest in getting paid right</h2>
-              <p className="lead">
-                You never pay for a denied operation. Nothing moved, so nothing is
-                charged.
+              <p className="sub">
+                You never pay for a denied operation. Nothing moved, so nothing
+                is charged.
               </p>
             </div>
 
-            <div className="grid-3 price">
+            <div className="grid-3">
               {PRICING.map((p) => (
                 <div
                   className={`price-card${p.featured ? " featured" : ""}`}
                   key={p.name}
                 >
-                  <h3>{p.name}</h3>
+                  <span className="price-name">{p.name}</span>
                   <div className="amount">
-                    {p.price} <small>{p.unit}</small>
+                    {p.price}
+                    <small>{p.unit}</small>
                   </div>
                   <ul>
                     {p.items.map((i) => (
-                      <li key={i}>{i}</li>
+                      <li key={i}>
+                        <Check
+                          size={15}
+                          color={p.featured ? "#0098f2" : "#0098f2"}
+                        />
+                        {i}
+                      </li>
                     ))}
                   </ul>
                   <a
-                    className={`btn ${p.featured ? "btn-accent" : ""}`}
+                    className={`btn ${p.featured ? "btn-ghost" : "btn-fill"}`}
                     href="#cta"
                     style={{ marginTop: "auto" }}
                   >
@@ -429,16 +478,16 @@ export default function Home() {
             </div>
 
             <p className="price-note">
-              Pricing shown is indicative for design review, not a published
-              rate card.
+              Pricing shown is indicative for design review, not a published rate
+              card.
             </p>
           </div>
         </section>
 
-        {/* ---------- faq ---------- */}
+        {/* ============================ faq ============================ */}
         <section className="section" id="faq">
           <div className="wrap">
-            <div className="section-head">
+            <div className="sec-head">
               <span className="eyebrow">Let&apos;s clear things up</span>
               <h2 className="display">Questions, answered plainly</h2>
             </div>
@@ -446,7 +495,12 @@ export default function Home() {
             <div className="faq">
               {FAQ.map((f) => (
                 <details key={f.q}>
-                  <summary>{f.q}</summary>
+                  <summary>
+                    {f.q}
+                    <span className="ic">
+                      <Plus size={18} />
+                    </span>
+                  </summary>
                   <p>{f.a}</p>
                 </details>
               ))}
@@ -454,23 +508,21 @@ export default function Home() {
           </div>
         </section>
 
-        {/* ---------- cta ---------- */}
+        {/* ============================ cta ============================ */}
         <section className="section" id="cta">
           <div className="wrap">
             <div className="cta">
               <span className="eyebrow">Let&apos;s make something good</span>
-              <h2 className="display" style={{ maxWidth: "20ch" }}>
-                Run your next pay run on CrewPay
-              </h2>
-              <p className="lead" style={{ maxWidth: "56ch" }}>
+              <h2>Run your next pay run on CrewPay</h2>
+              <p>
                 Send us your contributor list and your rules. We&apos;ll run the
                 first pay run with you and show you the ledger it produces.
               </p>
-              <div className="hero-cta">
-                <a className="btn btn-primary" href="mailto:hello@crewpay.xyz">
+              <div className="hero-actions">
+                <a className="btn btn-fill" href="mailto:hello@crewpay.xyz">
                   Book a pay run
                 </a>
-                <a className="btn" href="#capabilities">
+                <a className="btn btn-outline" href="#product">
                   Read the capabilities
                 </a>
               </div>
@@ -479,47 +531,58 @@ export default function Home() {
         </section>
       </main>
 
-      {/* ---------- footer ---------- */}
+      {/* ============================ footer ============================ */}
       <footer className="footer">
         <div className="wrap">
-          <div className="footer-inner">
-            <div className="footer-col" style={{ maxWidth: 320 }}>
+          <div className="footer-top">
+            <div className="footer-about">
               <span className="brand">
-                <span className="brand-mark" aria-hidden />
+                <span
+                  style={{
+                    width: 26,
+                    height: 26,
+                    borderRadius: 888,
+                    background: "#0d111b",
+                    display: "inline-block",
+                  }}
+                  aria-hidden
+                />
                 CrewPay
               </span>
-              <span>
+              <p>
                 Payroll and payouts for the agentic workforce. A policy-guarded
                 agent runs global pay runs on stablecoin rails.
-              </span>
+              </p>
             </div>
 
-            <div className="footer-col">
-              <b>Product</b>
-              <a href="#capabilities">Capabilities</a>
-              <a href="#flows">Flows</a>
-              <a href="#receipts">Ledger &amp; receipts</a>
-              <a href="#pricing">Pricing</a>
-            </div>
-
-            <div className="footer-col">
-              <b>Rails</b>
-              <a href="#rails">NEAR Intents</a>
-              <a href="#rails">PingPay</a>
-              <a href="#rails">OutLayer TEE</a>
-              <a href="#faq">FAQ</a>
-            </div>
-
-            <div className="footer-col">
-              <b>Contact</b>
-              <a href="mailto:hello@crewpay.xyz">hello@crewpay.xyz</a>
-              <a href="#cta">Book a pay run</a>
+            <div className="footer-cols">
+              <div className="footer-col">
+                <b>Product</b>
+                <a href="#product">Capabilities</a>
+                <a href="#flows">Flows</a>
+                <a href="#faq">Proof</a>
+                <a href="#pricing">Pricing</a>
+              </div>
+              <div className="footer-col">
+                <b>Rails</b>
+                <a href="#product">NEAR Intents</a>
+                <a href="#product">PingPay</a>
+                <a href="#product">OutLayer TEE</a>
+                <a href="#faq">FAQ</a>
+              </div>
+              <div className="footer-col">
+                <b>Contact</b>
+                <a href="mailto:hello@crewpay.xyz">hello@crewpay.xyz</a>
+                <a href="#cta">Book a pay run</a>
+              </div>
             </div>
           </div>
 
-          <div className="footer-note">
+          <div className="footer-bottom">
             <span>© {new Date().getFullYear()} CrewPay</span>
-            <span>Non-custodial · not an employer of record · no license claims</span>
+            <span>
+              Non-custodial · not an employer of record · no license claims
+            </span>
           </div>
         </div>
       </footer>

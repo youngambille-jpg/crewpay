@@ -1,7 +1,7 @@
-import Link from "next/link";
+import { Logo } from "./Icons";
 
 const LINKS = [
-  { href: "#capabilities", label: "Capabilities" },
+  { href: "#product", label: "Product" },
   { href: "#flows", label: "Flows" },
   { href: "#why", label: "Why CrewPay" },
   { href: "#pricing", label: "Pricing" },
@@ -10,25 +10,30 @@ const LINKS = [
 
 export default function Nav() {
   return (
-    <header className="nav">
-      <div className="wrap nav-inner">
-        <Link href="/" className="brand" aria-label="CrewPay home">
-          <span className="brand-mark" aria-hidden />
+    <div className="nav-shell">
+      <header className="nav">
+        <a href="#top" className="brand" aria-label="CrewPay home">
+          <Logo />
           CrewPay
-        </Link>
+        </a>
 
         <nav className="nav-links" aria-label="Primary">
           {LINKS.map((l) => (
-            <a key={l.href} href={l.href}>
+            <a key={l.href} className="nav-link" href={l.href}>
               {l.label}
             </a>
           ))}
         </nav>
 
-        <a className="btn btn-primary btn-sm" href="#cta">
-          Book a pay run
-        </a>
-      </div>
-    </header>
+        <div className="nav-cta">
+          <a className="nav-login" href="#cta">
+            Sign in
+          </a>
+          <a className="btn btn-fill btn-sm" href="#cta">
+            Book a pay run
+          </a>
+        </div>
+      </header>
+    </div>
   );
 }

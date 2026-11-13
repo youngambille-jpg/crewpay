@@ -411,21 +411,30 @@ suite must stay offline and deterministic. Run it by hand or on a schedule.
 
 Next.js 16 + React 19, App Router, no other deps. One static route.
 
-- **Design system** (derived from the reference layout the user pointed at —
-  `zolo.framer.website`; treat it as the visual target, not a copy source):
-  near-black canvas `#09090b`, surfaces `#17171a`/`#1f1f23`, hairline borders
-  `rgba(152,152,163,0.14)`, single blue accent `#0099ff`, 32px card radii,
-  tight negative letter-spacing on display type. Tokens live in
-  `app/globals.css` under `:root`. Fonts via `next/font/google`: **Comfortaa**
-  (display), **Inter** (body), **Geist Mono** (labels/eyebrows).
-- **Sections** mirror the reference's structure: fixed nav → hero → rails strip
-  → capabilities (`01`–`04`) → flows → why-us → proof/receipts → pricing →
-  FAQ (native `<details>`) → CTA → footer.
-- **The hero terminal is the one interactive piece** (`components/PayRunTerminal.tsx`).
-  It replays the real `npm run demo` outcomes (one settled, one approval, one
-  `needs_review`, one denied) with an `IntersectionObserver` reveal, and honours
-  `prefers-reduced-motion` by showing everything at once. Its rows must keep
-  matching what the demo actually prints.
+- **Design system is the "Acctual" style reference**: a *light* theme on a
+  paper-white canvas. Near-monochrome ink with a single electric-blue accent
+  used only as functional punctuation (checkmarks, eyebrow labels) — never as a
+  button or surface fill. Flat solid fills, **no gradients anywhere**, and no
+  box-shadow on content cards (elevation is reserved for the nav pill, the paper
+  mockups, and the testimonial card).
+  - Palette: paper `#ffffff`, snow `#fafafa` / `#f7fafc` for alternating bands,
+    ink `#1e1e1e`, smoke `#666666` (the readable floor — never lighter for
+    body), fog `#8d8d8d`, mist `#ccd1da` borders, midnight `#0d111b` filled
+    buttons, electric blue `#0098f2`, iris `#6c56fc`, leaf `#5d9c06`.
+  - Shape: pill (100px) for all controls, 16px content cards, 20px images,
+    32px large panels. No radius below 10px on anything interactive.
+  - Type: **Inter** as the Open Runde substitute (weight 600 display, 500 body,
+    -0.03em tracking at 20px+), **Caveat** for handwritten annotations only.
+  - Tokens live in `app/globals.css` under `:root`; the reference's full token
+    block is mirrored there.
+- **Sections**: pill nav → hero with a layered paper-invoice stack → stats →
+  large feature panel → capabilities (`01`–`04`) → flows → why-us → proof →
+  pricing → FAQ (`<details>`) → CTA → footer.
+- **The hero paper stack is the signature element** (`components/PaperStack.tsx`):
+  three invoice/pay-run sheets, offset and rotated, rendered as real UI. Its data
+  mirrors what `npm run demo` actually produces (contractor settles, vendor held
+  for approval, agent paid per task, one line stops for review). Keep it truthful
+  if the demo changes.
 
 ### Landing page copy rules (do not weaken these)
 
@@ -435,14 +444,15 @@ The page sells a real product, so the copy is constrained by what is true:
   N countries", SOC2/ISO certification, holding customer funds, or paying out in
   local currency. The FAQ states the negatives on purpose — keep those.
 - **Never invent** testimonials, customer logos, or "trusted by N teams". The
-  reference template has all of these; we do not have customers yet, so the
-  social-proof section is replaced with **verifiable proof** — endpoints and
-  invariants (`Σ = 0`, drift check, non-custodial) that a reader can check.
+  reference style has a starred testimonial block; we have no customers yet, so
+  it is not used. Social proof is replaced with **verifiable proof** — endpoints
+  and invariants (`Σ = 0`, drift check, non-custodial) a reader can check.
 - Pricing figures on the page are illustrative for design review, and the page
   says so. Do not present them as a published rate card.
 - The strongest true claims are the differentiators: no LLM in the money path,
   unknown funding stops instead of retrying, and a confirmed deposit is not a
   paid payee.
+- Keep the palette discipline: at most two chromatic accents on any one screen.
 
 ## Status
 

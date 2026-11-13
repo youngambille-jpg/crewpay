@@ -1,23 +1,21 @@
 import type { Metadata } from "next";
-import { Inter, Comfortaa, Geist_Mono } from "next/font/google";
+import { Inter, Caveat } from "next/font/google";
 import "./globals.css";
 
+/* Open Runde is not on Google Fonts. Inter is the first-listed substitute in
+   the style reference and was also detected on the source page, so it carries
+   both display and body here. Caveat is the signature element, used only for
+   handwritten attributions and annotations. */
 const inter = Inter({
   subsets: ["latin"],
   variable: "--font-inter",
   display: "swap",
 });
 
-const comfortaa = Comfortaa({
+const caveat = Caveat({
   subsets: ["latin"],
-  weight: ["400", "500", "600", "700"],
-  variable: "--font-comfortaa",
-  display: "swap",
-});
-
-const geistMono = Geist_Mono({
-  subsets: ["latin"],
-  variable: "--font-mono-google",
+  weight: ["600"],
+  variable: "--font-caveat",
   display: "swap",
 });
 
@@ -40,9 +38,7 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body className={`${inter.variable} ${comfortaa.variable} ${geistMono.variable}`}>
-        {children}
-      </body>
+      <body className={`${inter.variable} ${caveat.variable}`}>{children}</body>
     </html>
   );
 }
