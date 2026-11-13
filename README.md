@@ -65,8 +65,9 @@ no network and no credentials, so it is reviewable before any rail is wired in.
 | `packages/signer` | **done** | 45 | OutLayer TEE custody, manifest compile + drift, four-way funding outcome |
 | `apps/agent` | **done** | 26 | Orchestrator: pay runs and per-task agent payouts |
 | `apps/api` | **done** | 39 | Control plane over `node:http`, in-memory store |
+| `apps/web` | **done** | — | Marketing landing page (Next.js 16 + React 19, static) |
 
-**183 tests, `tsc` clean.**
+**215 tests, `tsc` clean.**
 
 ## The three money flows
 
@@ -152,13 +153,19 @@ No build step and no runtime dependencies are needed for the core packages.
 
 ```bash
 npm install        # links the workspace packages
-npm test           # 183 tests across policy, ledger, rails, signer, agent and api
+npm test           # 215 tests across policy, ledger, rails, signer, agent and api
 npm run demo       # end-to-end pay run against the FakeRail + FakeSigner
 npm run test:signer    # signer outcome, manifest and idempotency tests only
 npm run verify:tokens  # check the pinned asset table against live 1Click
 npm run smoke:live     # run the real rails against live services (needs network)
 npm run typecheck  # strict tsc, no emit
+npm run web        # landing page (Next.js) on http://localhost:3000
+npm run web:build  # production build of the landing page
 ```
+
+`apps/web` is the marketing landing page (Next.js 16 + React 19). It is the only
+component with a build step and the only one with runtime dependencies; the core
+money packages stay dependency-free and are untouched by it.
 
 `smoke:live` is the one command here that touches the network, so it is
 deliberately not part of `npm test`. It asserts that our parsers accept what the

@@ -15,9 +15,12 @@ npm install       # links workspace packages (npm workspaces)
 npm test          # node --test, default discovery
 npm run demo      # end-to-end pay run against FakeRail
 npm run typecheck # tsc --noEmit, strict
+npm run web       # Next.js landing page, dev server on :3000
+npm run web:build # production build of the landing page
 ```
 
-There is no build step. There are no runtime dependencies in the core packages.
+There is no build step for the core packages. They have no runtime
+dependencies. The one app with a build step is `apps/web` (Next.js).
 
 ## Toolchain facts (important)
 
@@ -33,8 +36,16 @@ There is no build step. There are no runtime dependencies in the core packages.
 - **Workspace packages need an `exports` map** (`{".": "./src/index.ts"}`) or
   Node's ESM resolver falls back to `index.js` and fails. `apps/*` need this too
   if another package imports them.
-- The toolchain is offline. `npm install` works from cache; adding a new
-  dependency may not. Prefer the standard library.
+- The core toolchain needs no network, but the registry is reachable: `npm
+  install` pulled Next 16 and React 19 from the network, and `smoke:live`
+  reaches live services. Prefer the standard library for the money packages
+  anyway; a dependency in the payment path is a liability, not a convenience.
+- **`apps/web` is deliberately isolated from the core toolchain.** The root
+  `tsconfig.json` includes only `packages/*/src/**` and `apps/*/src/**`, and
+  `apps/web` keeps its sources in `app/` + `components/` (no `src/`), so root
+  `tsc` and `node --test` never see it. Do not move web sources under `src/` or
+  widen the root `include`, or `npm test`/`typecheck` will start type-checking
+  JSX. The web app is built with its own `next build`.
 
 ## Code conventions
 
@@ -396,11 +407,50 @@ suite must stay offline and deterministic. Run it by hand or on a schedule.
   x402 facilitator, not the 1Click rail, and is recorded as `settlesVia:
   "agentpay"` so resolve does not ask the wrong service.
 
+## Landing page (`apps/web`)
+
+Next.js 16 + React 19, App Router, no other deps. One static route.
+
+- **Design system** (derived from the reference layout the user pointed at —
+  `zolo.framer.website`; treat it as the visual target, not a copy source):
+  near-black canvas `#09090b`, surfaces `#17171a`/`#1f1f23`, hairline borders
+  `rgba(152,152,163,0.14)`, single blue accent `#0099ff`, 32px card radii,
+  tight negative letter-spacing on display type. Tokens live in
+  `app/globals.css` under `:root`. Fonts via `next/font/google`: **Comfortaa**
+  (display), **Inter** (body), **Geist Mono** (labels/eyebrows).
+- **Sections** mirror the reference's structure: fixed nav → hero → rails strip
+  → capabilities (`01`–`04`) → flows → why-us → proof/receipts → pricing →
+  FAQ (native `<details>`) → CTA → footer.
+- **The hero terminal is the one interactive piece** (`components/PayRunTerminal.tsx`).
+  It replays the real `npm run demo` outcomes (one settled, one approval, one
+  `needs_review`, one denied) with an `IntersectionObserver` reveal, and honours
+  `prefers-reduced-motion` by showing everything at once. Its rows must keep
+  matching what the demo actually prints.
+
+### Landing page copy rules (do not weaken these)
+
+The page sells a real product, so the copy is constrained by what is true:
+
+- **Never claim**: EOR / licensed payroll / money transmission, "compliant in
+  N countries", SOC2/ISO certification, holding customer funds, or paying out in
+  local currency. The FAQ states the negatives on purpose — keep those.
+- **Never invent** testimonials, customer logos, or "trusted by N teams". The
+  reference template has all of these; we do not have customers yet, so the
+  social-proof section is replaced with **verifiable proof** — endpoints and
+  invariants (`Σ = 0`, drift check, non-custodial) that a reader can check.
+- Pricing figures on the page are illustrative for design review, and the page
+  says so. Do not present them as a published rate card.
+- The strongest true claims are the differentiators: no LLM in the money path,
+  unknown funding stops instead of retrying, and a confirmed deposit is not a
+  paid payee.
+
 ## Status
 
 Done and tested: `domain`, `policy`, `ledger`, `rails` (incl. 1Click adapter,
 PingPay checkout/webhook, Agent Pay x402 + MPP charge), `signer` (OutLayer TEE
 custody + FakeSigner), agent orchestration (pay run + agent task payouts), api
 skeleton, approvals inbox, policy manifest + drift, PingPay invoices, agent task
-payouts + 1099-style export, funding reconciliation into the books. 215 tests.
-Not started: Postgres persistence, web UI.
+payouts + 1099-style export, funding reconciliation into the books, and the
+`apps/web` Next.js landing page. 215 tests.
+Not started: Postgres persistence, authenticated app console (the landing page
+is the only frontend so far).
