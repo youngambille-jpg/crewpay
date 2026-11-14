@@ -26,11 +26,11 @@ export default function Nav() {
         </nav>
 
         <div className="nav-cta">
-          <a className="nav-login" href="#cta">
-            Sign in
+          <a className="nav-login" href="/app">
+            Dashboard
           </a>
-          <a className="btn btn-fill btn-sm" href="#cta">
-            Book a pay run
+          <a className="btn btn-fill btn-sm" href="/app/connect">
+            Try the demo
           </a>
         </div>
       </header>

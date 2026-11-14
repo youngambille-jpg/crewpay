@@ -482,6 +482,29 @@ on the landing page, it does not belong here.
   Execute is kept separate from approve because execution re-checks current
   policy — collapsing them would hide that an approval can go stale.
 
+### Live mode and the connect/policy screens (added for the demo)
+
+`CREWPAY_MODE=live` swaps the money-path adapters for real ones (needs
+`OUTLAYER_API_KEY`; without it, it warns and keeps the fake rail). The read-only
+probes in `apps/api/src/live.ts` (`LiveServices`) always hit the real endpoints,
+whatever the mode, so `/v1/live/health` is a genuine reachability check.
+
+- **`/v1/connect` mints a real wallet but must never return its key.** OutLayer's
+  `/register` returns `handoff_url` with the `wk_` API key in its query string.
+  This API is served publicly, so serialising that URL puts the key in the page
+  DOM for anyone to read. Instead `GET /v1/connect` returns `hasHandoff: boolean`
+  and the dashboard links to `/v1/connect/handoff`, which 302-redirects
+  server-side. `live.test.ts` asserts no response body contains `wk_`. Do not
+  reintroduce the URL into any JSON response.
+- **Compiled is not stored.** `encrypt-policy` + sign work on an unfunded wallet,
+  but storing the policy on-chain does not. So the TEE reports `policy: "none"`
+  and a dry-run that passes means *nothing refused it*, not yet that the limits
+  allowed it. The UI says this in as many words; keep it that way.
+- **The topbar states the mode twice on purpose**: the services are genuinely
+  reachable (green) while the money path is simulated (amber, `simulated rail:
+  fake`) and "broadcast needs a funded wallet". A single green dot would imply
+  funds are moving when they are not.
+
 ### API endpoints the dashboard relies on (added for it)
 
 `GET /v1/payees`, `GET /v1/pay-runs` (with `items`, newest first),
@@ -496,6 +519,8 @@ PingPay checkout/webhook, Agent Pay x402 + MPP charge), `signer` (OutLayer TEE
 custody + FakeSigner), agent orchestration (pay run + agent task payouts), api
 skeleton, approvals inbox, policy manifest + drift, PingPay invoices, agent task
 payouts + 1099-style export, funding reconciliation into the books, and the
-`apps/web` Next.js landing page. 215 tests.
-Not started: Postgres persistence, authenticated app console (the landing page
-is the only frontend so far).
+`apps/web` Next.js landing page, and the live connect/policy demo path
+(`LiveServices`, `live.test.ts`). 233 tests.
+Not started: Postgres persistence, auth on the app console (it is open, and the
+`/v1/connect` handoff redirect is unauthenticated until then), and on-chain
+policy storage (needs a funded account).

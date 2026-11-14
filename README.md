@@ -231,7 +231,38 @@ POST   /v1/agent-tasks                 pay an agent per task (x402 quote/deposit
 GET    /v1/agent-tasks                 agent tasks (?orgId=)
 GET    /v1/exports/agent-payments      1099-style roll-up by payee (?orgId=&year=)
 GET    /v1/ledger                      journal entries + trial balance + attestation (?orgId=)
+GET    /v1/live/health                 probe the real external services (1Click, OutLayer, Ping)
+POST   /v1/connect                     provision a real custody wallet in the provider's enclave
+GET    /v1/connect                     connected wallet, or not — never the key
+GET    /v1/connect/handoff             302 to the provider's dashboard (carries the key, so never JSON)
+POST   /v1/policies/publish            compile the org rules into an encrypted policy and sign it
+POST   /v1/live/dry-run                ask the enclave what it would do with a real withdraw
+GET    /v1/live/custody                the wallet's own policy state and balance, read back
 ```
+
+### Live mode and the demo path
+
+`CREWPAY_MODE=live` makes the API talk to the real services instead of the
+in-process fakes: OutLayer for custody and policy, 1Click for the token feed,
+PingPay for x402. It also needs `OUTLAYER_API_KEY`; without it the money path
+falls back to the fake rail and says so on startup. The dashboard exposes the
+whole path in two screens:
+
+1. `/app/connect` — probe the live services, then mint a real custody wallet.
+2. `/app/policy` — edit the rules, **Compile & sign policy**, then **Run dry-run**
+   to ask the enclave what it would do with a real withdraw.
+
+Two limits are deliberate and are stated in the UI rather than papered over:
+
+- **The policy is compiled and signed, but not yet stored on-chain.** Storing it
+  needs a funded account, so the enclave reports `policy: "none"` and a dry-run
+  that passes means *nothing refused it*, not yet that your limits allowed it.
+- **No funds move.** The minted wallet holds nothing, so nothing can be
+  broadcast from it. The rail is the fake one until a funded account is wired.
+
+The custody handoff URL embeds the wallet's `wk_` API key, so it is never
+serialised to a client: the dashboard links to `/v1/connect/handoff`, which
+redirects server-side. `live.test.ts` asserts the key appears in no response body.
 
 ### Not built: `POST /v1/webhooks/1click`
 

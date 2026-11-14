@@ -13,14 +13,17 @@ import "../app.css";
 export default async function AppLayout({ children }: { children: ReactNode }) {
   let counts: Partial<Record<string, number>> = {};
   let rail = "unknown";
+  let mode: "demo" | "live" = "demo";
 
   try {
-    const [approvals, worklist, health] = await Promise.all([
+    const [approvals, worklist, health, live] = await Promise.all([
       api.approvals(),
       api.worklist(),
       api.health(),
+      api.liveHealth().catch(() => null),
     ]);
     rail = health.rail;
+    if (live) mode = live.mode;
     counts = {
       "/app/approvals": approvals.filter((a) => a.status === "pending").length,
       "/app/worklist": worklist.length,
@@ -35,9 +38,14 @@ export default async function AppLayout({ children }: { children: ReactNode }) {
       <div className="main">
         <div className="topbar">
           <span className="crumb">Acme Inc</span>
+          {/* Two separate claims, so neither is overstated: the external services
+              are genuinely reachable, while the money path is simulated. */}
           <span className="rail-pill">
-            <span className="live" />
-            rail: {rail}
+            <span className={mode === "live" ? "live" : "sim"} />
+            {mode === "live" ? "live rail" : `simulated rail: ${rail}`}
+          </span>
+          <span className="rail-pill" style={{ color: "var(--fog)" }}>
+            broadcast needs a funded wallet
           </span>
           <div className="topbar-right">
             <span className="avatar">O</span>

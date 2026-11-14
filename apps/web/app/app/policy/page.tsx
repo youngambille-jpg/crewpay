@@ -1,14 +1,22 @@
 import Status, { Panel } from "@/components/app/Status";
 import PolicyForm from "@/components/app/PolicyForm";
-import { api } from "@/lib/api";
+import PublishPolicy from "@/components/app/PublishPolicy";
+import { api, type ConnectState } from "@/lib/api";
 
 /**
  * Policy: the rules in force, and the manifest they compile to for the custody
  * wallet. The manifest is what OutLayer actually enforces; the drift check
  * compares our compiled intent against the wallet's effective policy.
+ *
+ * Below both, the publish + dry-run panels take the rules all the way into the
+ * enclave and test a withdraw against them without moving funds.
  */
 export default async function PolicyPage() {
-  const [manifest, policy] = await Promise.all([api.manifest(), api.policy()]);
+  const [manifest, policy, connect] = await Promise.all([
+    api.manifest(),
+    api.policy(),
+    api.connectState().catch((): ConnectState => ({ connected: false })),
+  ]);
   const m = manifest.manifest;
 
   return (
@@ -77,6 +85,8 @@ export default async function PolicyPage() {
           ) : null}
         </div>
       </div>
+
+      <PublishPolicy rules={policy.rules} connect={connect} />
 
       <p className="page-note">
         Saving publishes a new version; it never edits the active one in place, so

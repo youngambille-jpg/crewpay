@@ -25,6 +25,7 @@ const GROUPS: { label: string; links: { href: string; label: string }[] }[] = [
   {
     label: "Control",
     links: [
+      { href: "/app/connect", label: "Connect" },
       { href: "/app/policy", label: "Policy" },
       { href: "/app/ledger", label: "Ledger" },
     ],

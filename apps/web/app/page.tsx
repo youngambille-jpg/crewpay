@@ -199,8 +199,8 @@ export default function Home() {
             </p>
 
             <div className="hero-actions">
-              <a className="btn btn-fill" href="#cta">
-                Book a pay run
+              <a className="btn btn-fill" href="/app/connect">
+                Try the live demo
               </a>
               <a className="btn btn-outline" href="#flows">
                 See how it works
@@ -519,11 +519,11 @@ export default function Home() {
                 first pay run with you and show you the ledger it produces.
               </p>
               <div className="hero-actions">
-                <a className="btn btn-fill" href="mailto:hello@crewpay.xyz">
-                  Book a pay run
+                <a className="btn btn-fill" href="/app/connect">
+                  Open the demo
                 </a>
-                <a className="btn btn-outline" href="#product">
-                  Read the capabilities
+                <a className="btn btn-outline" href="mailto:hello@crewpay.xyz">
+                  Book a pay run
                 </a>
               </div>
             </div>

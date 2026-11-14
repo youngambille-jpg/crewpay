@@ -21,6 +21,7 @@ import { compileManifest, diffManifest, type ManifestDrift } from "@crewpay/sign
 import { executeApproved, executeRun, payAgentTask, resolveFunding } from "@crewpay/agent";
 import { allBalanced, attestation, trialBalance } from "@crewpay/ledger";
 import { activePolicy, createStore, recordFunding, resolveFundingRecord, type Store } from "./store.ts";
+import { LiveServices, toOutLayerRules } from "./live.ts";
 
 export interface ApiDeps {
   readonly rail: SettlementRail;
@@ -31,6 +32,12 @@ export interface ApiDeps {
   /** Agent Pay facilitator (x402). Without it, agent task payouts are off. */
   readonly agentpay?: AgentPayPort;
   readonly store?: Store;
+  /**
+   * Live access to the real external services. Present in both modes: the
+   * health check and the Connect flow are real regardless of whether the money
+   * path is fake, so an operator can always see the true state of the rails.
+   */
+  readonly live?: LiveServices;
 }
 
 interface PayRunRequest {
@@ -271,6 +278,140 @@ async function handle(
 
   if (method === "GET" && url.pathname === "/health") {
     return send(res, 200, { ok: true, rail: deps.rail.name });
+  }
+
+  // The real state of the three external services. Unauthenticated and cheap,
+  // so the landing page and the dashboard can both show live infrastructure
+  // rather than a hard-coded "all systems go".
+  if (method === "GET" && url.pathname === "/v1/live/health") {
+    if (!deps.live) return send(res, 200, { mode: "demo", services: [], allUp: false });
+    const force = url.searchParams.get("refresh") === "1";
+    const health = await deps.live.health(force ? 0 : 30_000);
+    return send(res, 200, health);
+  }
+
+  // Provision a real custody wallet. This is the demo's "connect" step: it mints
+  // a real OutLayer wallet with a real `wk_` key. The key stays in this process;
+  // the client only ever sees the public account id and the handoff link.
+  if (method === "POST" && url.pathname === "/v1/connect") {
+    if (!deps.live) return send(res, 400, { error: "live services not configured" });
+    try {
+      const wallet = await deps.live.connect();
+      return send(res, 201, {
+        connected: true,
+        wallet,
+        // Stated plainly so no screen implies funds are present: the wallet is
+        // real but empty, and only a funded wallet can broadcast.
+        funded: false,
+        note: "Real testnet-free wallet. Deposit to broadcast for real.",
+      });
+    } catch (err) {
+      return send(res, 502, {
+        error: err instanceof Error ? err.message : "connect failed",
+      });
+    }
+  }
+
+  if (method === "GET" && url.pathname === "/v1/connect") {
+    const wallet = deps.live?.connected;
+    if (!wallet) return send(res, 200, { connected: false });
+    // Only a boolean crosses the wire. The handoff URL carries the wallet key in
+    // its query string, so it is never serialised to a client — the browser is
+    // sent to /v1/connect/handoff, which redirects server-side.
+    return send(res, 200, {
+      connected: true,
+      wallet,
+      funded: false,
+      hasHandoff: Boolean(deps.live?.handoffUrl),
+    });
+  }
+
+  // Redirect to the custody provider's dashboard. The URL embeds the wallet key,
+  // so it is never returned as JSON — a redirect keeps it out of the page, the
+  // DOM, and any client-side cache, and it still lands the operator in the right
+  // wallet.
+  if (method === "GET" && url.pathname === "/v1/connect/handoff") {
+    const target = deps.live?.handoffUrl;
+    if (!target) return send(res, 404, { error: "no custody handoff available" });
+    res.writeHead(302, { location: target });
+    res.end();
+    return;
+  }
+
+  // Publish the org policy AND compile it into the blob the TEE enforces. The
+  // local policy governs CrewPay's own decisions; the compiled blob is the real
+  // custody-layer limit. Publishing both keeps them from drifting apart.
+  if (method === "POST" && url.pathname === "/v1/policies/publish") {
+    const body = (await readJson(req)) as { orgId: string; rules?: Record<string, unknown> };
+    if (!deps.live) return send(res, 400, { error: "live services not configured" });
+    if (!deps.live.connected) {
+      return send(res, 409, { error: "connect a custody wallet before publishing policy" });
+    }
+    try {
+      const compiled = await deps.live.compilePolicy(toOutLayerRules(body.rules ?? {}));
+      // Sign it too: that is as far as we can go without a funded account, and
+      // it gives the owner everything needed to store the policy themselves.
+      const signed = await deps.live.signPolicy(compiled.ciphertext);
+      return send(res, 201, {
+        published: true,
+        walletId: compiled.walletId,
+        ciphertext: compiled.ciphertext,
+        ciphertextBytes: compiled.ciphertext.length,
+        signed,
+        // The honest limit: compiled and signed, but not yet enforced on-chain.
+        policyState: "compiled",
+        note: "Compiled and signed. Storing it on-chain needs a funded account.",
+      });
+    } catch (err) {
+      return send(res, 502, { error: err instanceof Error ? err.message : "publish failed" });
+    }
+  }
+
+  // Ask the TEE whether a withdraw would pass. Runs the real policy and balance
+  // check with no signing and no broadcast — the core of the no-funds demo.
+  if (method === "POST" && url.pathname === "/v1/live/dry-run") {
+    const body = (await readJson(req)) as {
+      chain: string;
+      amount: string;
+      to: string;
+      token?: string;
+    };
+    if (!deps.live) return send(res, 400, { error: "live services not configured" });
+    if (!deps.live.connected) {
+      return send(res, 409, { error: "connect a custody wallet first" });
+    }
+    try {
+      const result = await deps.live.dryRunWithdraw(body);
+      return send(res, 200, result);
+    } catch (err) {
+      return send(res, 502, { error: err instanceof Error ? err.message : "dry-run failed" });
+    }
+  }
+
+  // The policy the TEE actually enforces, plus the intents balance. Read-only.
+  // `policyState` is the TEE's own answer, so a screen can say whether our
+  // limits are merely compiled or genuinely enforced.
+  if (method === "GET" && url.pathname === "/v1/live/custody") {
+    if (!deps.live) return send(res, 400, { error: "live services not configured" });
+    if (!deps.live.connected) return send(res, 200, { connected: false });
+    try {
+      const [policy, state, balance] = await Promise.all([
+        deps.live.effectivePolicy(),
+        deps.live.policyState(),
+        deps.live.intentsBalance("nep141:wrap.near"),
+      ]);
+      return send(res, 200, {
+        connected: true,
+        policy,
+        // "stored" means the enclave enforces it; "none" means it does not, so
+        // a passing dry-run is not yet evidence that our policy allowed it.
+        policyState: state.state,
+        policyVersion: state.version,
+        intentsBalance: balance,
+      });
+    } catch (err) {
+      return send(res, 502, { error: err instanceof Error ? err.message : "custody read failed" });
+    }
   }
 
   if (method === "POST" && url.pathname === "/v1/payees") {

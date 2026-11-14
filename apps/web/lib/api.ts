@@ -242,6 +242,77 @@ export interface Health {
   rail: string;
 }
 
+/* ------------------------- live infrastructure ------------------------- */
+
+export type ServiceStatus = "ok" | "down" | "skipped";
+
+export interface ServiceHealth {
+  name: string;
+  status: ServiceStatus;
+  detail: string;
+  ms: number;
+}
+
+export interface LiveHealth {
+  mode: "demo" | "live";
+  checkedAt: string;
+  services: ServiceHealth[];
+  allUp: boolean;
+}
+
+export interface LiveWallet {
+  walletId: string;
+  nearAccountId: string;
+  createdAt: string;
+}
+
+export interface ConnectState {
+  connected: boolean;
+  wallet?: LiveWallet;
+  funded?: boolean;
+  /** True when the provider offered a dashboard link. The URL itself is never sent. */
+  hasHandoff?: boolean;
+  note?: string;
+}
+
+export interface PolicyCheck {
+  withinLimits: boolean;
+  addressAllowed: boolean;
+}
+
+export interface DryRunResult {
+  wouldSucceed: boolean;
+  reason?: string;
+  message?: string;
+  policyCheck?: PolicyCheck;
+}
+
+export interface SignedPolicy {
+  signature: string;
+  publicKey: string;
+  version: number;
+  policyHash: string;
+  validUntil: number;
+}
+
+export interface PublishResult {
+  published: boolean;
+  walletId: string;
+  ciphertext: string;
+  ciphertextBytes: number;
+  signed: SignedPolicy;
+  policyState: "none" | "compiled" | "stored";
+  note: string;
+}
+
+export interface CustodyState {
+  connected: boolean;
+  policy?: Record<string, unknown>;
+  policyState?: "none" | "compiled" | "stored";
+  policyVersion?: number;
+  intentsBalance?: string;
+}
+
 /* ---------------------------- read helpers ---------------------------- */
 
 export const api = {
@@ -317,6 +388,30 @@ export const api = {
     }),
 
   setPolicy: (rules: Partial<PolicyRules>) => post<Policy>("/v1/policies", { orgId: ORG_ID, rules }),
+
+  /* --------------------------- live services --------------------------- */
+
+  /** Real health of 1Click, OutLayer and Ping. Cheap enough to call on load. */
+  liveHealth: (server = true) => get<LiveHealth>("/v1/live/health", server),
+
+  /** Provision a real OutLayer custody wallet. The `wk_` key stays server-side. */
+  connect: () => post<ConnectState>("/v1/connect", {}),
+
+  connectState: (server = true) => get<ConnectState>("/v1/connect", server),
+
+  /**
+   * Compile the org's rules into the blob the TEE enforces, and sign it. Storing
+   * it on-chain needs a funded account, so this stops at `compiled`.
+   */
+  publishPolicy: (rules: Partial<PolicyRules>) =>
+    post<PublishResult>("/v1/policies/publish", { orgId: ORG_ID, rules }),
+
+  /** Ask the TEE whether a withdraw would pass. No signing, no broadcast. */
+  dryRun: (req: { chain: string; amount: string; to: string; token?: string }) =>
+    post<DryRunResult>("/v1/live/dry-run", req),
+
+  /** The policy the enclave actually enforces, and the intents balance. */
+  custody: (server = true) => get<CustodyState>("/v1/live/custody", server),
 };
 
 /* ------------------------------ formatting ------------------------------ */
