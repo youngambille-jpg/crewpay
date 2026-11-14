@@ -67,7 +67,7 @@ no network and no credentials, so it is reviewable before any rail is wired in.
 | `apps/api` | **done** | 45 | Control plane over `node:http`, in-memory store |
 | `apps/web` | **done** | — | Landing page + operator dashboard (Next.js 16 + React 19) |
 
-**221 tests, `tsc` clean.**
+**233 tests, `tsc` clean.**
 
 ## The three money flows
 
@@ -153,7 +153,7 @@ No build step and no runtime dependencies are needed for the core packages.
 
 ```bash
 npm install        # links the workspace packages
-npm test           # 221 tests across policy, ledger, rails, signer, agent and api
+npm test           # 233 tests across policy, ledger, rails, signer, agent and api
 npm run demo       # end-to-end pay run against the FakeRail + FakeSigner
 npm run api        # serve the control plane + a seeded org on http://localhost:4000
 npm run test:signer    # signer outcome, manifest and idempotency tests only
