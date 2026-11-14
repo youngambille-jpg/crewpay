@@ -160,7 +160,9 @@ export class OutLayerSigner implements Signer {
     const row = await this.client.getRequest(requestId);
     const status = String(row.status);
     const result = (row.result ?? {}) as Record<string, unknown>;
-    const tx = result["destination_tx_hash"] ?? result["tx_hash"];
+    // Intents delivery first (a top-level hash there is not the delivery),
+    // then the wallet-ops top-level hash, then the nested fallback.
+    const tx = result["destination_tx_hash"] ?? row.tx_hash ?? result["tx_hash"];
     const reason = result["reason"];
     return {
       requestId,
@@ -269,9 +271,11 @@ export class OutLayerSigner implements Signer {
 
   /**
    * The proof handed to the rail. On the on-chain route that is the NEAR tx
-   * hash. On the Intents route there is no origin tx: the real, linkable
-   * transaction is `destination_tx_hash`, the delivery on the origin chain.
-   * Neither `transfer_intent_hash` nor `intent_hash` is a chain transaction.
+   * hash, which wallet ops return top-level (`row.tx_hash`, per the skill);
+   * the nested `result.tx_hash` is kept as a fallback. On the Intents route
+   * there is no origin tx: the real, linkable transaction is
+   * `destination_tx_hash`, the delivery on the origin chain. Neither
+   * `transfer_intent_hash` nor `intent_hash` is a chain transaction.
    */
   private proof(plan: FundingPlan, row: OutLayerRequestRow): DepositProof | undefined {
     const result = (row.result ?? {}) as Record<string, unknown>;
@@ -279,7 +283,9 @@ export class OutLayerSigner implements Signer {
       const tx = result["destination_tx_hash"];
       return typeof tx === "string" && tx ? { txHash: tx } : undefined;
     }
-    const tx = result["tx_hash"];
+    const direct = row.tx_hash;
+    const nested = result["tx_hash"];
+    const tx = typeof direct === "string" && direct ? direct : nested;
     return typeof tx === "string" && tx ? { txHash: tx } : undefined;
   }
 

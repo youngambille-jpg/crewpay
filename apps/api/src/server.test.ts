@@ -1,10 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
-import { FakeRail, FakePingPay, FakeAgentPay } from "@crewpay/rails";
+import { FakeRail, FakePingPay, FakeAgentPay, Relayer } from "@crewpay/rails";
 import { FakeSigner } from "@crewpay/signer";
 import { defaultRules } from "@crewpay/domain";
 import { createApi } from "./server.ts";
+import type { LiveServices } from "./live.ts";
+import { TEST_TOKEN, testAuth, type AuthConfig } from "./auth.ts";
 
 function base(chain: string, asset: string) {
   return { chain, asset };
@@ -15,14 +17,20 @@ async function start(
     signer?: FakeSigner;
     pingpay?: FakePingPay;
     agentpay?: FakeAgentPay;
+    auth?: AuthConfig;
+    live?: LiveServices;
+    relayer?: Relayer;
   } = {},
 ) {
-  const { signer, pingpay, agentpay, ...railOpts } = opts;
+  const { signer, pingpay, agentpay, auth, live, relayer, ...railOpts } = opts;
   const { server, store } = createApi({
+    auth: auth ?? testAuth(),
     rail: new FakeRail(railOpts),
     ...(signer ? { signer } : {}),
     ...(pingpay ? { pingpay } : {}),
     ...(agentpay ? { agentpay } : {}),
+    ...(live ? { live } : {}),
+    ...(relayer ? { relayer } : {}),
   });
   await new Promise<void>((resolve) => server.listen(0, resolve));
   const port = (server.address() as AddressInfo).port;
@@ -30,8 +38,27 @@ async function start(
   const call = async (path: string, method: string, body?: unknown) => {
     const res = await fetch(url + path, {
       method,
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", authorization: `Bearer ${TEST_TOKEN}` },
       ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    return { status: res.status, json: (await res.json()) as Record<string, unknown> };
+  };
+  /**
+   * A request with no Authorization header, or with whatever token is given.
+   * Used to prove what an anonymous or wrong-token caller can reach.
+   */
+  const raw = async (
+    path: string,
+    method = "GET",
+    opts: { body?: unknown; token?: string } = {},
+  ) => {
+    const res = await fetch(url + path, {
+      method,
+      headers: {
+        "content-type": "application/json",
+        ...(opts.token ? { authorization: `Bearer ${opts.token}` } : {}),
+      },
+      ...(opts.body ? { body: JSON.stringify(opts.body) } : {}),
     });
     return { status: res.status, json: (await res.json()) as Record<string, unknown> };
   };
@@ -41,7 +68,7 @@ async function start(
     const res = await fetch(url + path, { method: "POST", headers, body });
     return { status: res.status, json: (await res.json()) as Record<string, unknown> };
   };
-  return { server, store, call, rawPost };
+  return { server, store, call, raw, rawPost, url };
 }
 
 /** Seed one org with a policy, a payee, and a run that needs approval. */
@@ -117,12 +144,28 @@ test("health reports the active rail", async () => {
 test("a pay run without a policy is rejected", async () => {
   const { server, call } = await start();
   try {
+    // No orgId: the org is the caller's, and no policy has been published for
+    // it yet, so the run cannot be evaluated.
     const { status } = await call("/v1/pay-runs", "POST", {
-      orgId: "org_x",
       period: "2026-11",
       lines: [],
     });
     assert.equal(status, 400);
+  } finally {
+    server.close();
+  }
+});
+
+test("a pay run naming another org is not found, never executed", async () => {
+  const { server, call } = await start();
+  try {
+    await seedAndRun(call);
+    const { status } = await call("/v1/pay-runs", "POST", {
+      orgId: "org_other",
+      period: "2026-11",
+      lines: [{ payeeId: "ada", usdCents: 1_000 }],
+    });
+    assert.equal(status, 404);
   } finally {
     server.close();
   }
@@ -304,15 +347,52 @@ test("a failed execution marks the approval failed", async () => {
   }
 });
 
+test("a run whose only line fails flips from awaiting_approval to failed", async () => {
+  const { server, call } = await start({ failOperationIds: ["run_1_op_1"] });
+  try {
+    await seedAndRun(call);
+    const before = await call("/v1/pay-runs/run_1", "GET");
+    assert.equal((before.json["run"] as Record<string, unknown>)["status"], "awaiting_approval");
+
+    await call("/v1/approvals/apv_1/approve", "POST", { decidedBy: "owner" });
+    await call("/v1/approvals/apv_1/execute", "POST");
+
+    const after = await call("/v1/pay-runs/run_1", "GET");
+    assert.equal((after.json["run"] as Record<string, unknown>)["status"], "failed");
+  } finally {
+    server.close();
+  }
+});
+
+test("the failure reason travels with the line for the operator", async () => {
+  const { server, call } = await start({ failOperationIds: ["run_1_op_1"] });
+  try {
+    await seedAndRun(call);
+    await call("/v1/approvals/apv_1/approve", "POST", { decidedBy: "owner" });
+    await call("/v1/approvals/apv_1/execute", "POST");
+
+    const { json } = await call("/v1/operations", "GET");
+    const rows = json as unknown as Record<string, unknown>[];
+    const row = rows.find(
+      (r) => (r["record"] as Record<string, unknown> | undefined)?.["operationId"] === "run_1_op_1",
+    );
+    const note = (row?.["record"] as Record<string, unknown> | undefined)?.["note"];
+    assert.equal(typeof note, "string");
+    assert.ok(String(note).length > 0);
+  } finally {
+    server.close();
+  }
+});
+
 test("executing an approved operation carries the signer proof through", async () => {
-  const { server, store } = createApi({ rail: new FakeRail(), signer: new FakeSigner() });
+  const { server, store } = createApi({ auth: testAuth(), rail: new FakeRail(), signer: new FakeSigner() });
   await new Promise<void>((resolve) => server.listen(0, resolve));
   const port = (server.address() as AddressInfo).port;
   const url = `http://127.0.0.1:${port}`;
   const call = async (path: string, method: string, body?: unknown) => {
     const res = await fetch(url + path, {
       method,
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", authorization: `Bearer ${TEST_TOKEN}` },
       ...(body ? { body: JSON.stringify(body) } : {}),
     });
     return { status: res.status, json: (await res.json()) as Record<string, unknown> };
@@ -361,8 +441,10 @@ test("the manifest endpoint compiles the active policy and warns on local-only r
 test("the manifest endpoint needs an org with an active policy", async () => {
   const { server, call } = await start();
   try {
+    // Omitting orgId now means "my org", which has no policy yet.
     assert.equal((await call("/v1/manifest", "GET")).status, 400);
-    assert.equal((await call("/v1/manifest?orgId=org_missing", "GET")).status, 400);
+    // Another org's manifest is not found, so its existence is not confirmed.
+    assert.equal((await call("/v1/manifest?orgId=org_missing", "GET")).status, 404);
   } finally {
     server.close();
   }
@@ -842,8 +924,12 @@ test("the export excludes a year with no payments and reports an empty roll-up",
 test("the export requires an org", async () => {
   const started = await start();
   try {
-    const res = await started.call("/v1/exports/agent-payments", "GET");
-    assert.equal(res.status, 400);
+    // No orgId defaults to the caller's own org, which is a legitimate read.
+    const own = await started.call("/v1/exports/agent-payments", "GET");
+    assert.equal(own.status, 200);
+    // Another org's export is not readable.
+    const other = await started.call("/v1/exports/agent-payments?orgId=org_other", "GET");
+    assert.equal(other.status, 404);
   } finally {
     started.server.close();
   }
@@ -899,10 +985,13 @@ test("the ledger export is scoped to one org", async () => {
   const started = await start({ signer: new FakeSigner() });
   try {
     await seedAndRun(started.call, { usdCents: 150_000 });
+    const own = await started.call("/v1/ledger?orgId=org_1", "GET");
+    assert.equal(own.status, 200);
+    assert.equal(own.json["entryCount"], 1);
+    // Another org's books are not merely empty to this caller — they are not
+    // readable at all, so a cross-org read cannot be mistaken for "no data".
     const other = await started.call("/v1/ledger?orgId=org_other", "GET");
-    assert.equal(other.status, 200);
-    assert.equal(other.json["entryCount"], 0);
-    assert.deepEqual(other.json["trialBalance"], []);
+    assert.equal(other.status, 404);
   } finally {
     started.server.close();
   }
@@ -911,8 +1000,10 @@ test("the ledger export is scoped to one org", async () => {
 test("the ledger export requires an org", async () => {
   const started = await start();
   try {
+    // Omitting orgId is no longer an error: it resolves to the caller's org.
     const res = await started.call("/v1/ledger", "GET");
-    assert.equal(res.status, 400);
+    assert.equal(res.status, 200);
+    assert.equal(res.json["orgId"], "org_1");
   } finally {
     started.server.close();
   }
@@ -1235,7 +1326,9 @@ test("payees are listed for an org, and filtered by it", async () => {
   const started = await start();
   try {
     await seedAndRun(started.call);
-    await started.call("/v1/payees", "POST", {
+    // Filing a payee into another org is not possible: the org is the caller's,
+    // so this lands in org_1 even though the body says org_2.
+    const filed = await started.call("/v1/payees", "POST", {
       id: "other",
       orgId: "org_2",
       kind: "vendor",
@@ -1245,14 +1338,21 @@ test("payees are listed for an org, and filtered by it", async () => {
       status: "approved",
       screening: "clear",
     });
+    assert.equal((filed.json as { orgId: string }).orgId, "org_1");
 
+    // Both payees are org_1's. Before auth, an omitted orgId returned every
+    // org's rows; this is the regression guard for that leak.
     const all = await started.call("/v1/payees", "GET");
     assert.equal(all.status, 200);
     assert.equal((all.json as unknown as unknown[]).length, 2);
 
     const scoped = await started.call("/v1/payees?orgId=org_1", "GET");
-    assert.equal((scoped.json as unknown as unknown[]).length, 1);
-    assert.equal((scoped.json as unknown as { id: string }[])[0]!.id, "ada");
+    assert.equal((scoped.json as unknown as unknown[]).length, 2);
+
+    // Naming another org is not an empty list — it is a refusal, so the caller
+    // learns nothing about whether org_2 has payees.
+    const foreign = await started.call("/v1/payees?orgId=org_2", "GET");
+    assert.equal(foreign.status, 404);
   } finally {
     started.server.close();
   }
@@ -1285,9 +1385,16 @@ test("a pay run list for an unknown org is empty, not an error", async () => {
   const started = await start();
   try {
     await seedAndRun(started.call);
-    const res = await started.call("/v1/pay-runs?orgId=nobody", "GET");
-    assert.equal(res.status, 200);
-    assert.deepEqual(res.json, []);
+    // A caller cannot ask for an org they do not belong to; the request is
+    // refused rather than answered with an empty list, which would suggest the
+    // org exists and merely has no runs.
+    const foreign = await started.call("/v1/pay-runs?orgId=nobody", "GET");
+    assert.equal(foreign.status, 404);
+
+    // Their own org, with no runs yet, is legitimately an empty list.
+    const own = await started.call("/v1/pay-runs?orgId=org_1", "GET");
+    assert.equal(own.status, 200);
+    assert.equal((own.json as unknown as unknown[]).length, 1);
   } finally {
     started.server.close();
   }
@@ -1332,5 +1439,362 @@ test("GET responses carry the CORS origin header", async () => {
     assert.equal(res.headers.get("access-control-allow-origin"), "*");
   } finally {
     started.server.close();
+  }
+});
+
+/* ---- authentication and org ownership -------------------------------------
+ *
+ * Before this, `orgId` came from the request: an omitted orgId returned every
+ * org's rows, and naming an org returned that org's payroll to anyone. These
+ * tests pin the replacement contract — a caller is identified by a token, and
+ * the org they may touch is a property of that token, never of the request.
+ */
+
+test("an anonymous request is refused, not answered", async () => {
+  const started = await start();
+  try {
+    await seedAndRun(started.call);
+    for (const [path, method] of [
+      ["/v1/payees", "GET"],
+      ["/v1/ledger", "GET"],
+      ["/v1/pay-runs", "GET"],
+      ["/v1/approvals", "GET"],
+      ["/v1/operations", "GET"],
+      ["/v1/notifications", "GET"],
+      ["/v1/agent-tasks", "GET"],
+      ["/v1/custody/requests", "GET"],
+      ["/v1/policies", "GET"],
+      ["/v1/manifest", "GET"],
+      ["/v1/exports/agent-payments", "GET"],
+      ["/v1/connect", "GET"],
+      ["/v1/connect/handoff", "GET"],
+      ["/v1/live/custody", "GET"],
+    ] as const) {
+      const res = await started.raw(path, method);
+      assert.equal(res.status, 401, `${method} ${path} should require a token`);
+    }
+  } finally {
+    started.server.close();
+  }
+});
+
+test("an anonymous write cannot change policy", async () => {
+  const started = await start();
+  try {
+    // The exact write that was possible before: publish a policy for org_1 with
+    // no credentials at all.
+    const published = await started.raw("/v1/policies", "POST", {
+      body: { orgId: "org_1", rules: { limits: { per_transaction: "999999999.00" } } },
+    });
+    assert.equal(published.status, 401);
+
+    // And nothing was written.
+    await started.call("/v1/policies", "POST", { orgId: "org_1" });
+    const policy = await started.call("/v1/policies?orgId=org_1", "GET");
+    assert.notEqual(
+      (policy.json["rules"] as { limits?: { per_transaction?: string } }).limits?.per_transaction,
+      "999999999.00",
+    );
+  } finally {
+    started.server.close();
+  }
+});
+
+test("a wrong token is refused the same way as no token", async () => {
+  const started = await start();
+  try {
+    await seedAndRun(started.call);
+    const res = await started.raw("/v1/payees", "GET", { token: "not-the-token" });
+    assert.equal(res.status, 401);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("the health and live-health endpoints stay reachable without a token", async () => {
+  const started = await start();
+  try {
+    assert.equal((await started.raw("/health")).status, 200);
+    assert.equal((await started.raw("/v1/live/health")).status, 200);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("a token scoped to another org sees only that org's data", async () => {
+  // Two orgs, two tokens. The first org has payroll; the second must not be able
+  // to read it even by naming it.
+  const started = await start({
+    auth: {
+      tokens: new Map([
+        ["token_a", { orgId: "org_a", label: "a" }],
+        ["token_b", { orgId: "org_b", label: "b" }],
+      ]),
+    },
+  });
+  try {
+    await started.raw("/v1/payees", "POST", {
+      token: "token_a",
+      body: {
+        id: "payee_a",
+        kind: "contractor",
+        displayName: "A",
+        destination: base("near", "usdc"),
+        address: "a.near",
+      },
+    });
+
+    // org_b's own read is empty and legitimate.
+    const asB = await started.raw("/v1/payees", "GET", { token: "token_b" });
+    assert.equal(asB.status, 200);
+    assert.equal((asB.json as unknown as unknown[]).length, 0);
+
+    // org_b asking for org_a's payees is refused, and learns nothing.
+    const asBSnooping = await started.raw("/v1/payees?orgId=org_a", "GET", { token: "token_b" });
+    assert.equal(asBSnooping.status, 404);
+
+    // org_a still sees its own.
+    const asA = await started.raw("/v1/payees", "GET", { token: "token_a" });
+    assert.equal((asA.json as unknown as unknown[]).length, 1);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("an approval from another org cannot be executed", async () => {
+  const started = await start({
+    auth: {
+      tokens: new Map([
+        ["token_a", { orgId: "org_a", label: "a" }],
+        ["token_b", { orgId: "org_b", label: "b" }],
+      ]),
+    },
+  });
+  try {
+    // Seed a run for org_a, which parks an approval.
+    await started.raw("/v1/payees", "POST", {
+      token: "token_a",
+      body: {
+        id: "payee_a",
+        kind: "contractor",
+        displayName: "A",
+        destination: base("near", "usdc"),
+        address: "a.near",
+        status: "approved",
+        screening: "clear",
+      },
+    });
+    await started.raw("/v1/policies", "POST", { token: "token_a", body: { orgId: "org_a" } });
+    const run = await started.raw("/v1/pay-runs", "POST", {
+      token: "token_a",
+      body: { period: "2026-11", lines: [{ payeeId: "payee_a", usdCents: 250_000 }] },
+    });
+    const approvalId = (run.json["approvals"] as string[])[0]!;
+
+    // org_b tries to approve and execute org_a's parked payment.
+    const approve = await started.raw(`/v1/approvals/${approvalId}/approve`, "POST", {
+      token: "token_b",
+      body: { decidedBy: "attacker" },
+    });
+    assert.equal(approve.status, 404);
+
+    const execute = await started.raw(`/v1/approvals/${approvalId}/execute`, "POST", {
+      token: "token_b",
+      body: {},
+    });
+    assert.equal(execute.status, 404);
+
+    // org_a's approval is untouched: still pending, nothing settled.
+    const still = await started.raw("/v1/approvals", "GET", { token: "token_a" });
+    const rows = still.json as unknown as { status: string }[];
+    assert.equal(rows[0]!.status, "pending");
+  } finally {
+    started.server.close();
+  }
+});
+
+test("a pay run cannot pay another org's payee", async () => {
+  const started = await start({
+    auth: {
+      tokens: new Map([
+        ["token_a", { orgId: "org_a", label: "a" }],
+        ["token_b", { orgId: "org_b", label: "b" }],
+      ]),
+    },
+  });
+  try {
+    await started.raw("/v1/payees", "POST", {
+      token: "token_a",
+      body: {
+        id: "payee_a",
+        kind: "contractor",
+        displayName: "A",
+        destination: base("near", "usdc"),
+        address: "a.near",
+        status: "approved",
+        screening: "clear",
+      },
+    });
+    await started.raw("/v1/policies", "POST", { token: "token_b", body: { orgId: "org_b" } });
+
+    // org_b, with its own policy in place, tries to pay org_a's payee.
+    const run = await started.raw("/v1/pay-runs", "POST", {
+      token: "token_b",
+      body: { period: "2026-11", lines: [{ payeeId: "payee_a", usdCents: 1_000 }] },
+    });
+    // The payee is not org_b's, so the run cannot resolve it: refused, not paid.
+    assert.ok(run.status >= 400, `expected refusal, got ${run.status}`);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("the pingpay webhook needs no token but still needs a valid signature", async () => {
+  const pingpay = new FakePingPay({ webhookSecret: "whsec_test" });
+  const started = await start({ pingpay });
+  try {
+    // A correctly signed event is accepted with no Authorization header.
+    const signed = pingpay.signEvent({
+      id: "evt_auth_1",
+      type: "checkout.session.expired",
+      resourceId: "cs_unknown",
+    });
+    const ok = await started.rawPost("/v1/webhooks/pingpay", signed.body, {
+      "content-type": "application/json",
+      "x-ping-signature": String(signed.headers.signature),
+      "x-ping-timestamp": String(signed.headers.timestamp),
+    });
+    assert.equal(ok.status, 200);
+
+    // A forged one is not.
+    const forged = await started.rawPost("/v1/webhooks/pingpay", '{"id":"evt_forged"}', {
+      "content-type": "application/json",
+      "x-ping-signature": "deadbeef",
+      "x-ping-timestamp": "1",
+    });
+    assert.notEqual(forged.status, 200);
+  } finally {
+    started.server.close();
+  }
+});
+
+/* --------------------------- funding: wallet + intents --------------------------- */
+
+/**
+ * A stand-in for LiveServices that answers the funding-quote call the way the
+ * real one does: a live 1Click price, no deposit address. Only the one method
+ * the funding routes use is implemented; everything else is absent on purpose.
+ */
+function stubLiveQuote(): LiveServices {
+  return {
+    fundingQuote: async ({ chain }: { chain: string }) => ({
+      chain: { chain, asset: "usdc", symbol: "USDC", label: chain, refundTo: "0x0" },
+      origin: { chain, asset: "usdc" },
+      destination: { chain: "near", asset: "usdt" },
+      preview: {
+        correlationId: "corr_1",
+        amountIn: "1014373",
+        amountInFormatted: "1.014373",
+        amountInUsd: "1.013961164562",
+        amountOut: "1000000",
+        amountOutFormatted: "1.0",
+        amountOutUsd: "0.999594000000",
+        withdrawFee: "4152",
+        refundFee: "2400",
+        timeEstimate: 35,
+        deadline: "2026-11-14T10:00:00.000Z",
+      },
+    }),
+  } as unknown as LiveServices;
+}
+
+test("funding chains list the origins a deposit can be priced from", async () => {
+  const { server, call } = await start();
+  try {
+    const res = await call("/v1/funding/chains", "GET");
+    assert.equal(res.status, 200);
+    const chains = res.json as unknown as { chain: string; symbol: string; label: string }[];
+    assert.ok(chains.length >= 4);
+    assert.ok(chains.some((c) => c.chain === "base" && c.symbol === "USDC"));
+    assert.ok(chains.some((c) => c.chain === "sol"));
+    // A chain entry never leaks the internal refund placeholder.
+    assert.ok(!("refundTo" in chains[0]!));
+  } finally {
+    server.close();
+  }
+});
+
+test("a funding quote is priced live and marked simulated, with no deposit address", async () => {
+  const { server, call } = await start({ live: stubLiveQuote() });
+  try {
+    const res = await call("/v1/funding/quote", "POST", {
+      chain: "base",
+      usdCents: 10000,
+      recipient: "43b130e564b41e2f8f5d5ede77dd47a241b5d9ee04cc21aae3eb038eea0822e9",
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.json["simulated"], true);
+    const preview = res.json["preview"] as Record<string, unknown>;
+    assert.equal(preview["amountOut"], "1000000");
+    assert.equal(preview["timeEstimate"], 35);
+    // The whole point: a price, never an address funds could be sent to.
+    assert.ok(!("depositAddress" in preview));
+    assert.match(String(res.json["note"]), /no testnet/);
+  } finally {
+    server.close();
+  }
+});
+
+test("a funding quote refuses a bad request rather than guessing", async () => {
+  const { server, call } = await start({ live: stubLiveQuote() });
+  try {
+    assert.equal((await call("/v1/funding/quote", "POST", { usdCents: 100 })).status, 400);
+    assert.equal((await call("/v1/funding/quote", "POST", { chain: "base" })).status, 400);
+    assert.equal((await call("/v1/funding/quote", "POST", { chain: "base", usdCents: 0 })).status, 400);
+    assert.equal((await call("/v1/funding/quote", "POST", { chain: "base", usdCents: -5 })).status, 400);
+  } finally {
+    server.close();
+  }
+});
+
+test("funding quote answers 400, not a crash, when live services are absent", async () => {
+  const { server, call } = await start();
+  try {
+    const res = await call("/v1/funding/quote", "POST", { chain: "base", usdCents: 100 });
+    assert.equal(res.status, 400);
+  } finally {
+    server.close();
+  }
+});
+
+test("the relay route answers 400 when no relayer is configured", async () => {
+  const { server, call } = await start();
+  try {
+    const res = await call("/v1/relay", "POST", { signedDelegateAction: "AAAA" });
+    assert.equal(res.status, 400);
+  } finally {
+    server.close();
+  }
+});
+
+test("the relay route requires a signed delegate action", async () => {
+  const { server, call } = await start({ relayer: new Relayer({ allowedReceivers: ["agent.testnet"] }) });
+  try {
+    assert.equal((await call("/v1/relay", "POST", {})).status, 400);
+    assert.equal((await call("/v1/relay", "POST", { signedDelegateAction: "" })).status, 400);
+  } finally {
+    server.close();
+  }
+});
+
+test("a malformed delegate action is a 400 rejection, not a crash", async () => {
+  const { server, call } = await start({ relayer: new Relayer({ allowedReceivers: ["agent.testnet"] }) });
+  try {
+    const res = await call("/v1/relay", "POST", { signedDelegateAction: "not borsh at all" });
+    assert.equal(res.status, 400);
+    assert.equal(res.json["status"], "rejected");
+    assert.equal(res.json["broadcastable"], false);
+  } finally {
+    server.close();
   }
 });

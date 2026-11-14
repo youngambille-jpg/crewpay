@@ -7,3 +7,7 @@ export * from "./pingpay-fake.ts";
 export * from "./agentpay.ts";
 export * from "./agentpay-fake.ts";
 export * from "./mpp.ts";
+export * from "./metatx.ts";
+export * from "./relayer.ts";
+export * from "./crosschain.ts";
+export * from "./testnet.ts";

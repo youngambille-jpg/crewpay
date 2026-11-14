@@ -60,14 +60,14 @@ no network and no credentials, so it is reviewable before any rail is wired in.
 | --- | --- | --- | --- |
 | `packages/domain` | done | — | Types: money, payees, operations, pay runs, policies, invoices, agent tasks |
 | `packages/policy` | **done** | 15 | The deterministic constraint engine (the moat) |
-| `packages/ledger` | **done** | 6 | Double-entry journal with balanced-entry enforcement |
-| `packages/rails` | **done** | 52 | `SettlementRail` + `FakeRail`, 1Click adapter, PingPay checkout/webhook, Agent Pay (x402 + MPP) |
-| `packages/signer` | **done** | 45 | OutLayer TEE custody, manifest compile + drift, four-way funding outcome |
-| `apps/agent` | **done** | 26 | Orchestrator: pay runs and per-task agent payouts |
-| `apps/api` | **done** | 45 | Control plane over `node:http`, in-memory store |
-| `apps/web` | **done** | — | Landing page + operator dashboard (Next.js 16 + React 19) |
+| `packages/ledger` | **done** | 11 | Double-entry journal with balanced-entry enforcement |
+| `packages/rails` | **done** | 99 | `SettlementRail` + `FakeRail`, 1Click adapter, PingPay checkout/webhook, Agent Pay (x402 + MPP), `CrossChainRail`, NEP-366 `Relayer` |
+| `packages/signer` | **done** | 56 | OutLayer TEE custody, manifest compile + drift, four-way funding outcome |
+| `apps/agent` | **done** | 30 | Orchestrator: pay runs and per-task agent payouts |
+| `apps/api` | **done** | 112 | Control plane over `node:http`, in-memory store, bearer-token auth + org ownership |
+| `apps/web` | **done** | 35 | Operator console (TanStack Start + React 19), Payees + Policy + Ledger wired |
 
-**233 tests, `tsc` clean.**
+**358 tests, `tsc` clean.**
 
 ## The three money flows
 
@@ -153,43 +153,47 @@ No build step and no runtime dependencies are needed for the core packages.
 
 ```bash
 npm install        # links the workspace packages
-npm test           # 233 tests across policy, ledger, rails, signer, agent and api
-npm run demo       # end-to-end pay run against the FakeRail + FakeSigner
-npm run api        # serve the control plane + a seeded org on http://localhost:4000
+npm test           # 358 tests across policy, ledger, rails, signer, agent, api and web
+CREWPAY_API_TOKEN=$(openssl rand -hex 32) npm run api   # serve the control plane (token required, live testnet)
 npm run test:signer    # signer outcome, manifest and idempotency tests only
 npm run verify:tokens  # check the pinned asset table against live 1Click
 npm run smoke:live     # run the real rails against live services (needs network)
 npm run typecheck  # strict tsc, no emit
-npm run web        # landing page + dashboard (Next.js) on http://localhost:3000
-npm run web:build  # production build of the web app
+npm run web        # operator console (TanStack Start) on http://localhost:3000
+npm run web:build  # production build of the console
 
 ./scripts/redeploy.sh   # build (if needed), start both, verify every route
 ```
 
-`redeploy.sh` is the way to bring the demo up on a fresh container. It starts
+`redeploy.sh` is the way to bring the console up on a fresh container. It starts
 both servers detached (`setsid`) so they are not reaped when the shell that
 launched them exits — starting them by hand is why the public link goes dead
 between sessions. It is safe to re-run.
 
-`apps/web` is the marketing landing page **and the operator dashboard**
-(Next.js 16 + React 19). It is the only component with a build step and the only
-one with runtime dependencies; the core money packages stay dependency-free and
-are untouched by it.
+`apps/web` is the operator console (TanStack Start + React 19, built with Vite)
+and nothing else: `/` is a door page linking into `/app`. It is the only
+component with a build step and the only one with runtime dependencies; the core
+money packages stay dependency-free and are untouched by it.
 
-The dashboard (`/app`) is a real client of the API, not a mock: it reads pay
-runs, approvals, the funding worklist, payees, invoices, agent tasks, the policy
-and the ledger, and its buttons perform real writes (approve → execute, resolve,
-create a pay run, issue an invoice, pay an agent task, publish a policy). To use
-it, run both processes:
+The console is a real client of the API, not a mock: it reads the API through
+same-origin server functions and its buttons perform real writes. **Only the
+Payees screen is wired today** — every other entity throws rather than render a
+plausible empty table, so an unwired screen fails loudly instead of looking like
+an empty org. See `ONBOARDING.md` for the wiring plan. To use it, run both
+processes:
 
 ```
-npm run api        # control plane on :4000, seeds org_1
-npm run web        # web app on :3000, proxies /api/* to the API
+CREWPAY_API_TOKEN=$(openssl rand -hex 32) npm run api   # control plane on :4000, live testnet
+CREWPAY_API_TOKEN=$CREWPAY_API_TOKEN npm run web        # web app on :3000, same-origin server functions call the API
 ```
 
-Then open <http://localhost:3000/app>. The seed is shaped so every policy
-outcome appears at least once — a settled contractor, a held vendor, a denied
-agent — so no screen is empty. Set `API_ORIGIN` if the API is not on port 4000.
+The two processes must share one token: the API requires it, and the web app
+presents it on the browser's behalf. `scripts/redeploy.sh` does this for you.
+
+Then open <http://localhost:3000/app>. There is no seed data: a fresh start
+shows honest empty states, and the first run needs a published policy, an
+approved payee, and — for testnet settlement — a funded testnet wallet. Set
+`API_ORIGIN` if the API is not on port 4000.
 
 `smoke:live` is the one command here that touches the network, so it is
 deliberately not part of `npm test`. It asserts that our parsers accept what the
@@ -198,14 +202,6 @@ token list and a dry quote, Ping x402 discovery, and an OutLayer **testnet**
 wallet (`POST /register` mints a throwaway one). Set `PING_API_KEY` to also
 exercise the PingPay checkout and facilitator paths. It catches shape drift in
 minutes and needs nothing from anyone.
-
-The demo seeds four payees and runs one pay run. Expected result: one contractor
-settles (with a deposit proof), one operation's funding is escalated to
-`needsReview`, one vendor over the approval threshold opens an approval that is
-then approved and executed, and one agent payee over the per-kind cap is denied.
-It then prints the policy compiled to an OutLayer manifest, runs the invoice
-flow (a Ping checkout session, settled by a signed webhook, opening a pay run),
-and pays an agent for a task over x402, printing the 1099-style export.
 
 ### API surface
 
@@ -218,6 +214,10 @@ GET    /v1/pay-runs                    list pay runs
 GET    /v1/pay-runs/:id                run + per-line states, decisions, receipts
 GET    /v1/operations                  operations + policy decisions (?orgId=&status=)
 GET    /v1/notifications               notification outbox (?orgId=)
+POST   /v1/testnet/wallet              register the server-held testnet wallet
+GET    /v1/testnet/wallet              testnet wallet balances (never the key)
+POST   /v1/testnet/prepare             storage + mint + recipient registration
+POST   /v1/testnet/pay-runs            pay run settling mock USDT on testnet
 GET    /v1/approvals                   approvals inbox (?orgId=&status=)
 POST   /v1/approvals/:id/approve       one-signature approval
 POST   /v1/approvals/:id/reject        reject
@@ -243,17 +243,60 @@ POST   /v1/live/dry-run                ask the enclave what it would do with a r
 GET    /v1/live/custody                the wallet's own policy state and balance, read back
 ```
 
-### Live mode and the demo path
+### Live mode and the testnet path
 
-`CREWPAY_MODE=live` makes the API talk to the real services instead of the
-in-process fakes: OutLayer for custody and policy, 1Click for the token feed,
-PingPay for x402. It also needs `OUTLAYER_API_KEY`; without it the money path
-falls back to the fake rail and says so on startup. The dashboard exposes the
-whole path in two screens:
+The API has one mode: live on testnet. It registers an OutLayer testnet wallet
+at boot and settles through the testnet rail and signer — no fake adapters in
+the served path, so a green run means real mock-USDT moved on testnet. The
+console exposes the whole path in one screen:
 
-1. `/app/connect` — probe the live services, then mint a real custody wallet.
-2. `/app/policy` — edit the rules, **Compile & sign policy**, then **Run dry-run**
-   to ask the enclave what it would do with a real withdraw.
+`/app/testnet` — register the wallet, fund it with testnet NEAR, prepare
+(storage + mint + recipient registration), then pay and read the chain tx back.
+
+PingPay checkout and Agent Pay wire up only when `PING_API_KEY` is set; without
+it those routes answer 400 and the console says so. 1Click prices corridors via
+dry quotes; OutLayer policy compile/dry-run endpoints remain available over the
+API for the custody backstop.
+
+### Wallets: two of them, and they are different
+
+There are two wallets in this app and conflating them is the easiest way to
+mislead someone about who holds a key.
+
+- **Your NEAR wallet** (the top bar) is the operator's own account, signed in
+  with **NEAR Connect** (`@hot-labs/near-connect`). NEAR's docs are explicit
+  that the older `@near-wallet-selector/*` is deprecated and should not be used,
+  so it is not used here. NEAR Connect loads each wallet's script from a shared
+  manifest at runtime, so this app bundles no wallet code and never sees a key.
+  Neither balances nor read-only calls come from the connector — its docs say so
+  plainly — so both go through a `near-api-js` `JsonRpcProvider` against a public
+  RPC node. Set `NEXT_PUBLIC_NEAR_NETWORK=mainnet` (default `testnet`) to switch
+  chains, and `NEXT_PUBLIC_NEAR_RPC_URL` to override the node.
+- **The custody wallet** (the `/app/testnet` screen) is CrewPay's enclave-held
+  signer, minted by the API against OutLayer testnet. Its key never leaves the
+  server; the UI sees only the public account id and its on-chain balances.
+
+The app shell wraps every `/app` screen in the NEAR Connect provider, so the
+wallet session survives navigation. Nothing about the wallet session is sent to
+the API — it is the operator's identity at the wallet layer, not an API credential.
+
+### Authentication
+
+The API serves payroll and the books, so it requires a bearer token on every
+route except `/health`, `/v1/live/health`, and the PingPay webhook (which carries
+an HMAC signature instead, since Ping cannot present a token).
+
+- `CREWPAY_API_TOKEN` — the token. There is no default: `serve.ts` refuses to
+  start without it, because a default would mean an unauthenticated server.
+- `CREWPAY_ORG_ID` — the org that token may act on (default `org_1`).
+
+The token is a *client* credential, not a user login: it identifies the org, not
+the human. Two people sharing one token are indistinguishable to the API.
+
+The dashboard never sees the token. `/api/*` is served by a route handler
+(`apps/web/app/api/[...path]/route.ts`) that attaches it server-side, so no
+credential reaches the browser — which is why there is no `NEXT_PUBLIC_` token.
+`scripts/redeploy.sh` generates one and gives it to both processes.
 
 Two limits are deliberate and are stated in the UI rather than papered over:
 

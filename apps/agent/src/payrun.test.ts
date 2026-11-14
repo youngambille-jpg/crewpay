@@ -8,7 +8,7 @@ import {
   corridor,
   defaultRules,
 } from "@crewpay/domain";
-import { FakeRail } from "@crewpay/rails";
+import { CrossChainRail, FakeRail } from "@crewpay/rails";
 import { FakeSigner } from "@crewpay/signer";
 import { executeRun } from "./payrun.ts";
 
@@ -214,4 +214,50 @@ test("the daily cap seeds from prior spend across runs", async () => {
   );
   assert.deepEqual(result.denied, ["op_1"]);
   assert.equal(result.settledCents, 0);
+});
+
+test("an unreachable corridor fails by name before funding, leaving no deposit", async () => {
+  const p = payee("ada");
+  const signer = new FakeSigner();
+  let funded = 0;
+  signer.fund = async () => {
+    funded += 1;
+    return { kind: "failed", reason: "should never be called", safeToRetry: true };
+  };
+  const rail = new CrossChainRail({
+    nearRail: new FakeRail(),
+    treasury: { chain: "near", asset: "usdt" },
+  });
+  const base = line("op_1", "ada", 150_000);
+  const toBase: { item: PayRunItem; operation: Operation } = {
+    item: base.item,
+    operation: { ...base.operation, origin: NEAR_USDC, destination: BASE_USDC, corridor: corridor(NEAR_USDC, BASE_USDC) },
+  };
+  const result = await executeRun("org_1", policy(), [toBase], {
+    ...deps([p]),
+    rail,
+    signer,
+  });
+
+  assert.deepEqual(result.failed, ["op_1"]);
+  assert.deepEqual(result.needsReview, []);
+  assert.equal(result.settledCents, 0);
+  assert.equal(funded, 0, "an unreachable corridor is refused before the signer moves anything");
+  const outcome = result.outcomes[0]!;
+  assert.equal(outcome.settlement?.status, "failed");
+  assert.match(String(outcome.settlement?.failureReason), /crosschain_unreachable/);
+});
+
+test("a NEAR corridor still settles for real through the router", async () => {
+  const p = payee("ada", { destination: NEAR_USDC });
+  const rail = new CrossChainRail({
+    nearRail: new FakeRail(),
+    treasury: { chain: "near", asset: "usdt" },
+  });
+  const result = await executeRun("org_1", policy(), [line("op_1", "ada", 150_000)], {
+    ...deps([p]),
+    rail,
+  });
+  assert.equal(result.settledCents, 150_000);
+  assert.equal(result.outcomes[0]!.settlement?.status, "settled");
 });

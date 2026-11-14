@@ -1,0 +1,115 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 220 22% 97%;
+    --foreground: 222 32% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 32% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 32% 11%;
+    --primary: 243 70% 59%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 16% 95%;
+    --secondary-foreground: 222 25% 18%;
+    --muted: 220 16% 95%;
+    --muted-foreground: 220 9% 45%;
+    --accent: 243 90% 97%;
+    --accent-foreground: 243 60% 45%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 15% 90%;
+    --input: 220 15% 89%;
+    --ring: 243 70% 59%;
+    --chart-1: 243 70% 62%;
+    --chart-2: 199 89% 60%;
+    --chart-3: 160 60% 55%;
+    --chart-4: 43 90% 62%;
+    --chart-5: 340 75% 60%;
+    --radius: 0.875rem;
+    --font-heading: "Instrument Sans", ui-sans-serif, system-ui, sans-serif;
+    --font-body: "Instrument Sans", ui-sans-serif, system-ui, sans-serif;
+    --font-display: "Instrument Sans", ui-sans-serif, system-ui, sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    --sidebar-background: 0 0% 100%;
+    --sidebar-foreground: 222 25% 18%;
+    --sidebar-primary: 243 70% 59%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 220 20% 96%;
+    --sidebar-accent-foreground: 222 25% 18%;
+    --sidebar-border: 220 15% 91%;
+    --sidebar-ring: 243 70% 59%;
+  }
+
+  .dark {
+    --background: 222 30% 7%;
+    --foreground: 220 20% 96%;
+    --card: 222 26% 10%;
+    --card-foreground: 220 20% 96%;
+    --popover: 222 26% 10%;
+    --popover-foreground: 220 20% 96%;
+    --primary: 243 70% 65%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 222 20% 16%;
+    --secondary-foreground: 220 20% 96%;
+    --muted: 222 20% 16%;
+    --muted-foreground: 220 12% 62%;
+    --accent: 222 20% 18%;
+    --accent-foreground: 220 20% 96%;
+    --destructive: 0 62% 45%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 222 18% 19%;
+    --input: 222 18% 19%;
+    --ring: 243 70% 65%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    @apply bg-background text-foreground font-body antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "ss01";
+  }
+
+  ::selection {
+    background: hsl(243 70% 59% / 0.18);
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: hsl(220 12% 82%);
+    border: 3px solid transparent;
+    background-clip: content-box;
+    border-radius: 999px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(220 12% 70%);
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+@layer utilities {
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+  .card-surface {
+    @apply rounded-2xl border border-border/70 bg-card;
+    box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 14px 34px -26px rgba(16, 24, 40, 0.5);
+  }
+  .hairline {
+    @apply border-border/60;
+  }
+}

@@ -5,6 +5,7 @@ import { FakeRail } from "@crewpay/rails";
 import { FakeSigner } from "@crewpay/signer";
 import { defaultRules } from "@crewpay/domain";
 import { createApi } from "./server.ts";
+import { TEST_TOKEN, testAuth } from "./auth.ts";
 
 function base(chain: string, asset: string) {
   return { chain, asset };
@@ -13,6 +14,7 @@ function base(chain: string, asset: string) {
 async function start(opts: ConstructorParameters<typeof FakeRail>[0] & { signer?: FakeSigner } = {}) {
   const { signer, ...railOpts } = opts;
   const { server, store } = createApi({
+    auth: testAuth(),
     rail: new FakeRail(railOpts),
     ...(signer ? { signer } : {}),
   });
@@ -22,7 +24,7 @@ async function start(opts: ConstructorParameters<typeof FakeRail>[0] & { signer?
   const call = async (path: string, method: string, body?: unknown) => {
     const res = await fetch(url + path, {
       method,
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", authorization: `Bearer ${TEST_TOKEN}` },
       ...(body ? { body: JSON.stringify(body) } : {}),
     });
     return { status: res.status, json: (await res.json()) as Record<string, unknown> };

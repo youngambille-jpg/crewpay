@@ -17,10 +17,25 @@ export type PingPaymentStatus = "PENDING" | "SUCCESS" | "FAILED";
 
 export type InvoiceStatus =
   | "open"
+  | "pending"
   | "paid"
   | "expired"
   | "cancelled"
+  | "refunded"
   | "failed";
+
+/** One line on an invoice. `amount` is USD cents, like the invoice total. */
+export interface InvoiceLineItem {
+  readonly description: string;
+  readonly quantity: number;
+  readonly unitAmount: UsdCents;
+  /** `quantity * unitAmount`, stored so a line is never re-derived on display. */
+  readonly amount: UsdCents;
+}
+
+export function lineItemAmount(quantity: number, unitAmount: UsdCents): UsdCents {
+  return Math.round(quantity * unitAmount);
+}
 
 /**
  * An invoice issued to a customer, backed by a Ping hosted checkout session.
@@ -35,6 +50,10 @@ export interface Invoice {
   readonly orgId: string;
   readonly customerId: string;
   readonly amount: UsdCents;
+  /** Optional itemised breakdown. When absent the invoice is a single amount. */
+  readonly lineItems?: readonly InvoiceLineItem[];
+  /** ISO date the customer is asked to pay by. Not a hard cutoff — Ping owns expiry. */
+  readonly dueDate?: string;
   /** What the customer pays with, and what Ping settles to us. */
   readonly settlementAsset: ChainAsset;
   readonly status: InvoiceStatus;
@@ -52,6 +71,12 @@ export interface Invoice {
   readonly payRunId?: string;
   /** Ping's payment id once one exists. */
   readonly paymentId?: string;
+  /**
+   * Chain transaction(s) that settled the payment, once Ping reports them.
+   * Kept so a bookkeeper can trace a paid invoice to a real transaction rather
+   * than taking the status on trust.
+   */
+  readonly txHashes?: readonly string[];
   readonly paidAt?: string;
 }
 
@@ -91,6 +116,25 @@ export function invoiceStatusFor(session: PingCheckoutStatus): InvoiceStatus {
     case "CREATED":
     case "PENDING":
       return "open";
+    default:
+      return "open";
+  }
+}
+
+/**
+ * Which Ping *payment* statuses map to which invoice state. A payment that is
+ * merely `PENDING` moves the invoice to `pending` — money is on its way but has
+ * not cleared — which is why it is distinct from `open` (nothing sent yet) and
+ * from `paid` (cleared). `FAILED` is terminal non-payment.
+ */
+export function invoiceStatusForPayment(payment: PingPaymentStatus | string): InvoiceStatus {
+  switch (payment) {
+    case "SUCCESS":
+      return "paid";
+    case "PENDING":
+      return "pending";
+    case "FAILED":
+      return "failed";
     default:
       return "open";
   }

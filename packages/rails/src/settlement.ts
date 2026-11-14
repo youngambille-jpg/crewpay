@@ -72,6 +72,14 @@ export class RailError extends Error {
  */
 export interface SettlementRail {
   readonly name: string;
+  /**
+   * Decide, without moving anything, whether this rail can carry the corridor.
+   * A rail that only reaches part of a cross-chain corridor returns
+   * `{ ok: false }` here, and the money path stops *before* funding — so an
+   * unreachable corridor never leaves an orphaned deposit behind. Optional:
+   * a rail that carries everything it is quoted for simply omits it.
+   */
+  readonly preflight?: (op: Operation) => { ok: true } | { ok: false; reason: string };
   quote(op: Operation): Promise<Quote>;
   /**
    * Hand the deposit to the rail. `proof` is present when the signer has

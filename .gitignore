@@ -1,9 +1,18 @@
 node_modules/
 dist/
 .next/
+*.tsbuildinfo
 *.log
 .env
 .env.*
 !.env.example
 coverage/
 .DS_Store
+# Local runtime state (the held testnet wallet key). Never commit: it is a
+# credential, and the funded wallet it points at should not be re-created.
+.data/
+
+# Agent session transcripts: not source, and a transcript can contain a
+# pasted credential. Never commit them.
+trajectory-*.json
+conversation-*.txt

@@ -13,14 +13,19 @@ with custody in a TEE (OutLayer). `ARCHITECTURE.md` is the design of record.
 ```bash
 npm install       # links workspace packages (npm workspaces)
 npm test          # node --test, default discovery
-npm run demo      # end-to-end pay run against FakeRail
-npm run typecheck # tsc --noEmit, strict
-npm run web       # Next.js landing page, dev server on :3000
-npm run web:build # production build of the landing page
+npm run typecheck # tsc --noEmit (core) + web typecheck
+npm run web       # TanStack operator console, dev server on :3000
+npm run web:build # production build of the console
 ```
 
 There is no build step for the core packages. They have no runtime
-dependencies. The one app with a build step is `apps/web` (Next.js).
+dependencies. The one app with a build step is `apps/web` (Vite + TanStack
+Start).
+
+`npm run typecheck` is `tsc --noEmit` over the core packages only: the root
+`tsconfig.json` includes `packages/*/src` and `apps/*/src`, and `apps/web` is
+plain JavaScript (JSX) under `apps/web/src/`, so tsc never sees it. The console
+is checked by `eslint` (`npm run lint` inside `apps/web`) and by the Vite build.
 
 ## Toolchain facts (important)
 
@@ -37,15 +42,17 @@ dependencies. The one app with a build step is `apps/web` (Next.js).
   Node's ESM resolver falls back to `index.js` and fails. `apps/*` need this too
   if another package imports them.
 - The core toolchain needs no network, but the registry is reachable: `npm
-  install` pulled Next 16 and React 19 from the network, and `smoke:live`
-  reaches live services. Prefer the standard library for the money packages
-  anyway; a dependency in the payment path is a liability, not a convenience.
+  install` pulls the console's dependencies (React 19 and friends) from the
+  network, and `smoke:live` reaches live services. Prefer the standard library
+  for the money packages anyway; a dependency in the payment path is a
+  liability, not a convenience.
 - **`apps/web` is deliberately isolated from the core toolchain.** The root
-  `tsconfig.json` includes only `packages/*/src/**` and `apps/*/src/**`, and
-  `apps/web` keeps its sources in `app/` + `components/` (no `src/`), so root
-  `tsc` and `node --test` never see it. Do not move web sources under `src/` or
-  widen the root `include`, or `npm test`/`typecheck` will start type-checking
-  JSX. The web app is built with its own `next build`.
+  `tsconfig.json` includes only `packages/*/src/**/*.ts` and
+  `apps/*/src/**/*.ts`, and `apps/web` is plain JavaScript (JSX), so root `tsc`
+  and `node --test` never see it. Do not add `.ts` sources under `apps/web/src/`
+  or widen the root `include`, or `npm test`/`typecheck` will start type-checking
+  the console's dependencies. The web app is built with its own Vite build
+  (`npm run web:build`).
 
 ## Code conventions
 
@@ -407,87 +414,82 @@ suite must stay offline and deterministic. Run it by hand or on a schedule.
   x402 facilitator, not the 1Click rail, and is recorded as `settlesVia:
   "agentpay"` so resolve does not ask the wrong service.
 
-## Landing page (`apps/web`)
+## Operator console (`apps/web`)
 
-Next.js 16 + React 19, App Router, no other deps. One static route.
+TanStack Start + React 19 + Tailwind + shadcn/ui, built with Vite. The full
+build brief is `frontend.md`; the onboarding slice and the ordered plan for the
+rest are in `ONBOARDING.md`. Read those before touching the console.
 
-- **Design system is the "Acctual" style reference**: a *light* theme on a
-  paper-white canvas. Near-monochrome ink with a single electric-blue accent
-  used only as functional punctuation (checkmarks, eyebrow labels) — never as a
-  button or surface fill. Flat solid fills, **no gradients anywhere**, and no
-  box-shadow on content cards (elevation is reserved for the nav pill, the paper
-  mockups, and the testimonial card).
-  - Palette: paper `#ffffff`, snow `#fafafa` / `#f7fafc` for alternating bands,
-    ink `#1e1e1e`, smoke `#666666` (the readable floor — never lighter for
-    body), fog `#8d8d8d`, mist `#ccd1da` borders, midnight `#0d111b` filled
-    buttons, electric blue `#0098f2`, iris `#6c56fc`, leaf `#5d9c06`.
-  - Shape: pill (100px) for all controls, 16px content cards, 20px images,
-    32px large panels. No radius below 10px on anything interactive.
-  - Type: **Plus Jakarta Sans** as the Open Runde substitute (weight 600–700
-  display, 500 body, -0.03em tracking at 20px+), **Caveat** for handwritten
-  annotations only. Chosen over a neutral UI face for its geometric character.
-  - Tokens live in `app/globals.css` under `:root`; the reference's full token
-    block is mirrored there.
-- **Sections**: pill nav → hero with a layered paper-invoice stack → stats →
-  large feature panel → capabilities (`01`–`04`) → flows → why-us → proof →
-  pricing → FAQ (`<details>`) → CTA → footer.
-- **The hero paper stack is the signature element** (`components/PaperStack.tsx`):
-  three invoice/pay-run sheets, offset and rotated, rendered as real UI. Its data
-  mirrors what `npm run demo` actually produces (contractor settles, vendor held
-  for approval, agent paid per task, one line stops for review). Keep it truthful
-  if the demo changes.
+The former Next.js console — landing page included — was deleted. It is
+recoverable from git tag `web-nextjs-archive` and is the reference for the
+screens the new app does not have yet (agents, testnet).
 
-### Landing page copy rules (do not weaken these)
+- **It reads the live API, never fixtures.** There is no seed data anywhere:
+  `serve.ts` seeds nothing, and an empty store renders empty screens. Reads go
+  through `useRecords(entity)` -> `apiList`; writes through `src/lib/treasury.js`
+  -> `apiPost`. Both are same-origin server functions (`src/api/server-calls.js`).
+- **Unwired entities fail loudly.** `Payee` is wired through `useRecords`; every
+  other entity still throws (`notWired`), and `useRecords` throws for an entity
+  missing from `READERS`. A plausible empty table would claim the org has no data
+  when the screen is simply not connected — preserve this. Policy and Ledger are
+  wired too, but not through `useRecords`: each is a single object/aggregate read
+  (`readPolicy`, `readManifest`, `readLedger`), not a list of entities.
+- **Mapping is pure and tested.** `src/api/crewpay.js` has no imports, so
+  `crewpay.test.js` runs under `node --test`. Copy `toUiPayee`/`toServerPayee`
+  exactly for each new entity. USD crosses as integer cents; on-chain amounts
+  are strings and are never `Number()`-ed for display.
+- **Status vocabulary.** `src/lib/status.js` was written against the Base44
+  entity model and its keys do not match the server enums; an unknown value
+  renders neutral, so a mismatch is invisible. `ONBOARDING.md` §6 lists every
+  mismatch — fix it before building any new screen.
+- **Honesty rules.** A fetch failure shows an error, never a zero (a zero reads
+  as "nothing wrong"). An unknown status renders unmapped, not healthy. A risk
+  or screening value that nothing produced renders as "unscored", not as a
+  passing check.
 
-The page sells a real product, so the copy is constrained by what is true:
+### API endpoints the console relies on
 
-- **Never claim**: EOR / licensed payroll / money transmission, "compliant in
-  N countries", SOC2/ISO certification, holding customer funds, or paying out in
-  local currency. The FAQ states the negatives on purpose — keep those.
-- **Never invent** testimonials, customer logos, or "trusted by N teams". The
-  reference style has a starred testimonial block; we have no customers yet, so
-  it is not used. Social proof is replaced with **verifiable proof** — endpoints
-  and invariants (`Σ = 0`, drift check, non-custodial) a reader can check.
-- Pricing figures on the page are illustrative for design review, and the page
-  says so. Do not present them as a published rate card.
-- The strongest true claims are the differentiators: no LLM in the money path,
-  unknown funding stops instead of retrying, and a confirmed deposit is not a
-  paid payee.
-- Keep the palette discipline: at most two chromatic accents on any one screen.
+`GET /v1/payees`, `GET /v1/pay-runs` (with `items`, newest first),
+`GET /v1/invoices`, `GET /v1/policies` (active policy), `GET /v1/manifest`
+(compiled manifest + drift), `GET /v1/ledger` (entries + trial balance), and
+`POST /v1/policies` (publish a new version). Plus CORS headers and an `OPTIONS`
+preflight in `send`/`handle`.
 
-## Dashboard (`apps/web/app/app`)
+### Policy and Ledger screens
 
-The product UI, not a marketing page. **Functional focus**: tables, tiles,
-status pills and inline actions. Prose is limited to one `page-note` per screen
-explaining the invariant a reader could otherwise get wrong. If a fact belongs
-on the landing page, it does not belong here.
+These two are the differentiators (`ONBOARDING.md` §8 Slice 7), so they carry
+more honesty rules than the rest.
 
-- **It reads the live API, never fixtures.** Every page fetches the real
-  endpoints in `lib/api.ts`. Server components call the API process directly
-  (`API_ORIGIN`, default `http://127.0.0.1:4000`); client components go through
-  the `/api/*` rewrite in `next.config.ts` so the browser stays same-origin.
-- **Run both processes**: `npm run api` (seeds `org_1` from `apps/api/src/seed.ts`)
-  and `npm run web`. The web build needs `API_ORIGIN` set if the API is not on
-  4000.
-- **Screens**: Overview (needs-a-human + books + recent runs), Pay runs (+
-  compose), Approvals (approve/reject then execute), Worklist (resolve),
-  Payees (+ add), Invoices (+ issue), Agent tasks (+ pay, 1099 roll-up), Policy
-  (publish a new version + manifest drift), Ledger (trial balance + entries).
-- **Actions are real writes**, not simulations: approve→execute, resolve, create
-  pay run, add payee, create invoice, pay agent task, publish policy. They hit
-  the same handlers the tests cover.
-- **Honesty rules that apply here too**: a fetch failure shows an error banner,
-  never a zero (a zero reads as "nothing wrong"). Status pills have an explicit
-  tone map; an unknown status renders neutral rather than being guessed healthy.
-  Execute is kept separate from approve because execution re-checks current
-  policy — collapsing them would hide that an approval can go stale.
+- **Publishing always creates a version, never an edit.** `POST /v1/policies`
+  bumps `version` and deactivates the previous row, so a past decision still
+  replays against the rules that were in force. The form sends rules only — a
+  client-supplied `version` would let a caller rewrite history. With no active
+  policy the form seeds from `DEFAULT_RULES` (mirroring `defaultRules()`), so v1
+  carries real caps rather than `{}`; a `404 no active policy` is an empty state,
+  not an error, and must not hide the form.
+- **The manifest shows what did NOT travel.** `compileManifest` reports every
+  rule OutLayer cannot enforce (`warnings`) rather than dropping it silently, so
+  the manifest never looks stronger than it is. Render the warnings; do not
+  filter them.
+- **Drift is reported, never corrected.** The wallet's policy is the owner's.
+  When a custody signer is present the API diffs it against ours; an absent
+  wallet field is itself drift (an absent limit is not the limit we proposed).
+  With no signer there is nothing to compare, so the panel says "drift not
+  checked" rather than implying agreement.
+- **Ledger amounts are exact base units, never dollars.** An entry's postings
+  carry a base-unit string at the asset's own scale, and the scale is not in the
+  entry, so the screen shows the string verbatim and never `Number()`-es it into
+  a dollar figure. `toUiLedger` keeps them strings (`String(...)`) for the same
+  reason. The API refuses to report an unbalanced ledger, so a ledger error is a
+  real integrity failure, not a fetch problem — the screen names the currency.
 
-### Live mode and the connect/policy screens (added for the demo)
+### Live testnet and the connect/policy screens
 
-`CREWPAY_MODE=live` swaps the money-path adapters for real ones (needs
-`OUTLAYER_API_KEY`; without it, it warns and keeps the fake rail). The read-only
-probes in `apps/api/src/live.ts` (`LiveServices`) always hit the real endpoints,
-whatever the mode, so `/v1/live/health` is a genuine reachability check.
+CrewPay runs on NEAR testnet only: the money path is `TestnetRail` +
+`TestnetSigner` against a server-held OutLayer testnet wallet, registered at boot
+in `serve.ts`. There is no demo or simulated mode and no seed data. The read-only
+probes in `apps/api/src/live.ts` (`LiveServices`) hit the real endpoints, so
+`/v1/live/health` is a genuine reachability check.
 
 - **`/v1/connect` mints a real wallet but must never return its key.** OutLayer's
   `/register` returns `handoff_url` with the `wk_` API key in its query string.
@@ -500,27 +502,116 @@ whatever the mode, so `/v1/live/health` is a genuine reachability check.
   but storing the policy on-chain does not. So the TEE reports `policy: "none"`
   and a dry-run that passes means *nothing refused it*, not yet that the limits
   allowed it. The UI says this in as many words; keep it that way.
-- **The topbar states the mode twice on purpose**: the services are genuinely
-  reachable (green) while the money path is simulated (amber, `simulated rail:
-  fake`) and "broadcast needs a funded wallet". A single green dot would imply
-  funds are moving when they are not.
+- **A funded wallet is the only thing between testnet and a real payout.** The
+  wallet is minted unfunded at boot and the key lives in memory only, so a
+  restart mints a fresh one and gas must be re-sent. The console says so rather
+  than implying funds are moving when they are not.
+- **The pay-run funding origin must be one this deployment can settle.** The
+  server defaults `origin` to `base:usdc`, but the testnet adapters only map the
+  corridors in `MOCK_ASSETS` (`near:usdt`, `near:usdc`). An omitted origin
+  therefore fails every line at execution with `no testnet mock known for
+  base:usdc` — after approval, not before, so the run looks fine until money
+  should move. The console sends `origin` explicitly (NewRunForm, default
+  `near:usdt`); any new caller of `POST /v1/pay-runs` must do the same.
+- **A run's status is a rollup, not a one-time snapshot.** `createPayRun`
+  computes `status` from the decision phase, but lines move later when approvals
+  execute. `refreshRunStatus` (called from `recordOutcome`) re-derives it, so a
+  run whose only line failed reads `failed` instead of `awaiting_approval`
+  forever. The line also carries the server's `note` (the chain's own refusal),
+  surfaced in `RunLines` — a failed payout the operator cannot see the reason for
+  is indistinguishable from a silent one.
 
-### API endpoints the dashboard relies on (added for it)
 
-`GET /v1/payees`, `GET /v1/pay-runs` (with `items`, newest first),
-`GET /v1/invoices`, `GET /v1/policies` (active policy). Plus CORS headers and an
-`OPTIONS` preflight in `send`/`handle`, which are **dev-grade** (`*`) until auth
-lands — pin the origin when it does.
+## Authentication and org ownership
+
+The API requires a bearer token. This replaced a scheme where `orgId` came from
+the request: an omitted `orgId` returned **every** org's rows, and naming an org
+returned that org's payroll to anyone — anonymous read of payroll and the books,
+and anonymous write of policy. That is closed.
+
+- **The org is the caller's, never the request's.** `apps/api/src/auth.ts`
+  resolves a `Principal` (token → `orgId`) and `handle` gates *before* routing,
+  so a handler added later is protected by default rather than by remembering.
+  Handlers call `access.org(requested)`: it returns the caller's org when none is
+  named, and `undefined` when a *different* org is named. `undefined` must become
+  **404, not 403** — a 403 confirms the id exists.
+- **Public by design, and only these**: `/health`, `/v1/live/health` (the console
+  shows real infrastructure), and `POST /v1/webhooks/pingpay`, which carries
+  an HMAC over the raw body because Ping cannot present a token. The webhook is
+  its own function (`handlePingWebhook`) precisely so the gate cannot swallow it.
+- **Two by-id checks matter as much as the list filters**: `GET /v1/pay-runs/:id`
+  and `/v1/approvals/:id/(approve|reject|execute)` compare `orgId`, and
+  `createPayRun` refuses a payee from another org — otherwise a caller could pay
+  a stranger's contractor.
+- **The token never reaches the browser.** The console calls same-origin server
+  functions (`apps/web/src/api/server-calls.js`) that attach it server-side. No
+  `VITE_`/`NEXT_PUBLIC_` token: a value the browser can read is a value an
+  attacker can read. `serve.ts` refuses to start without `CREWPAY_API_TOKEN`;
+  `scripts/redeploy.sh` generates one for both processes.
+- **Never build under a running server.** `vite build` rewrites
+  `dist/client/assets/*` with new content hashes and deletes the old files, so a
+  server started before the build serves HTML naming assets that no longer exist:
+  every route still returns 200, but the stylesheet 404s and the page renders
+  unstyled. Always rebuild first, then restart (`scripts/redeploy.sh` does both in
+  that order).
+- **This is a client credential, not a user login.** It scopes an org, not a
+  person. Multi-user identity, and pinning CORS off `*`, remain open.
+
+## Cross-chain payments
+
+`CrossChainRail` (`packages/rails/src/crosschain.ts`) is the router a pay run
+settles through. It is a `SettlementRail`, so `settleOperation` drives it
+unchanged; the only new behaviour is an honest verdict on reachability:
+
+- A **NEAR corridor** (`operation.destination.chain === treasury.chain`) goes to
+  the NEAR rail (`TestnetRail` on testnet), which really broadcasts.
+- A **corridor to another chain** is priced for real — a keyless 1Click
+  `dry: true` quote, wired from `LiveServices.crossChainPrice()` — then reported
+  as `crosschain_unreachable`. The destination swap runs on mainnet, which a
+  testnet deployment cannot reach, so no destination tx hash is ever claimed.
+  The live price rides along in `evidence.crosschainPrice` so an operator sees
+  what the corridor would have cost.
+
+`CrossChainRail` exposes an optional `preflight(op)` on `SettlementRail`.
+`settleOperation` calls it **before quoting or funding**: an unreachable
+corridor is refused before the signer moves anything, so no deposit is ever
+orphaned on-chain for a swap that cannot complete. Only `CrossChainRail`
+implements it; every other rail omits it and is unaffected.
+
+Keyless 1Click quotes a real price (`amountIn`, `amountOut`, fees, `timeEstimate`)
+but **never** a deposit address — minting one needs a partner key
+(`ONECLICK_API_KEY`). The router never needs a deposit address, because it never
+executes the outbound swap.
+
+## NEP-366 gas relay
+
+`Relayer` (`packages/rails/src/relayer.ts`) is the gas-sponsorship service. A
+payee (or an agent) that holds no NEAR signs a delegate action and posts it to
+`POST /v1/relay` as base64 borsh. The relayer decodes the exact bytes
+(`decodeSignedDelegateAction`), verifies the sender's signature and checks it
+against its policy (`validateDelegateAction`), spends the nonce
+(`NonceGuard`), then assembles the outer transaction (`planRelay`).
+
+The broadcast is the one step not performed: OutLayer's wallet API can only emit
+`transfer`/`ft_transfer`/`call`, never `Action::Delegate`. So a valid action
+returns `status: "planned"`, `broadcastable: false`, and a note saying exactly
+that — it never claims a tx hash it did not produce. The receiver allow-list is
+the payee account, so the relayer can only forward an action back to that
+account; it is never a chain-wide gas faucet.
 
 ## Status
 
 Done and tested: `domain`, `policy`, `ledger`, `rails` (incl. 1Click adapter,
-PingPay checkout/webhook, Agent Pay x402 + MPP charge), `signer` (OutLayer TEE
-custody + FakeSigner), agent orchestration (pay run + agent task payouts), api
-skeleton, approvals inbox, policy manifest + drift, PingPay invoices, agent task
-payouts + 1099-style export, funding reconciliation into the books, and the
-`apps/web` Next.js landing page, and the live connect/policy demo path
-(`LiveServices`, `live.test.ts`). 233 tests.
-Not started: Postgres persistence, auth on the app console (it is open, and the
-`/v1/connect` handoff redirect is unauthenticated until then), and on-chain
-policy storage (needs a funded account).
+PingPay checkout/webhook, Agent Pay x402 + MPP charge, TestnetRail,
+`CrossChainRail`, NEP-366 `Relayer`), `signer` (OutLayer TEE custody +
+TestnetSigner), agent
+orchestration (pay run + agent task payouts), api skeleton, approvals inbox,
+policy manifest + drift, PingPay invoices, agent task payouts + 1099-style
+export, funding reconciliation into the books, the TanStack operator console
+(Payees, Policy and Ledger wired; pay runs, approvals, invoices and worklist
+still pending), the live connect/policy path
+(`LiveServices`, `live.test.ts`), and bearer-token auth with org ownership.
+358 tests.
+Not started: Postgres persistence, multi-user identity (the token identifies an
+org, not a person; CORS is still `*`), and on-chain policy storage (needs a
+funded account).

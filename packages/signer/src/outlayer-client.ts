@@ -22,6 +22,8 @@ export interface OutLayerRequestRow {
   readonly type?: string;
   readonly status: OutLayerStatus | string;
   readonly poll_url?: string;
+  /** Chain tx for wallet ops (`/transfer`, `/call`): top-level, per the skill. */
+  readonly tx_hash?: string;
   readonly result?: Record<string, unknown> | null;
 }
 
@@ -118,14 +120,29 @@ export class OutLayerClient {
   ): Promise<OutLayerRequestRow> {
     const args: Record<string, string> = { receiver_id: to, amount };
     if (memo) args["msg"] = memo;
+    return this.callContract(token, "ft_transfer", args, key);
+  }
+
+  /**
+   * Call any method on any contract from the wallet's account. This is the
+   * escape hatch ft_transfer is built on: storage deposits and testnet minting
+   * go through here. `deposit` is yoctoNEAR attached to the call.
+   */
+  async callContract(
+    receiver: string,
+    method: string,
+    args: Record<string, unknown>,
+    key: string,
+    opts?: { gas?: string; deposit?: string },
+  ): Promise<OutLayerRequestRow> {
     return this.mutate(
       "/wallet/v1/call",
       {
-        receiver_id: token,
-        method_name: "ft_transfer",
+        receiver_id: receiver,
+        method_name: method,
         args,
-        gas: "30000000000000",
-        deposit: "1",
+        gas: opts?.gas ?? "30000000000000",
+        deposit: opts?.deposit ?? "1",
       },
       key,
     );

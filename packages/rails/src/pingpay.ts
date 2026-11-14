@@ -62,6 +62,8 @@ export interface PingPayPort {
   readonly name: string;
   createCheckout(input: CreateCheckoutInput): Promise<CheckoutSession>;
   getCheckout(sessionId: string): Promise<CheckoutSession>;
+  /** Read a payment's authoritative status. Optional: not every impl has it. */
+  getPayment?(paymentId: string): Promise<{ paymentId: string; status: string }>;
   verifyWebhook(rawBody: string, headers: PingWebhookHeaders): Record<string, unknown>;
 }
 

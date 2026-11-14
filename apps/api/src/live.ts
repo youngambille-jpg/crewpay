@@ -1,11 +1,10 @@
 /**
  * Live access to the three external services CrewPay depends on.
  *
- * Why this exists: the demo runs on `FakeRail`/`FakeSigner` so it needs no
- * network and no credentials, but a dashboard that only ever shows fake data
- * proves nothing. This module reaches the *real* services on the paths that are
- * free and unauthenticated, so the operator can see live infrastructure while
- * no money is at risk.
+ * CrewPay runs on NEAR testnet, so a dashboard that only ever showed fake data
+ * would prove nothing. This module reaches the *real* services on the paths
+ * that are free and unauthenticated, so the operator can see live
+ * infrastructure while no money is at risk.
  *
  * What is real here, and what is not — verified against the live APIs:
  *
@@ -29,10 +28,67 @@
  * written to disk.
  */
 
+import type { ChainAsset } from "@crewpay/domain";
+import {
+  AssetRegistry,
+  OneClickRail,
+  type DepositQuote,
+  type PriceSource,
+  type QuotePreview,
+} from "@crewpay/rails";
+
 const ONECLICK_URL = process.env["ONECLICK_BASE_URL"] ?? "https://1click.chaindefuser.com";
 const PING_URL = process.env["PING_BASE_URL"] ?? "https://pay.pingpay.io";
 const OUTLAYER_URL = process.env["OUTLAYER_BASE_URL"] ?? "https://api.outlayer.ai";
 const TIMEOUT_MS = Number(process.env["LIVE_TIMEOUT_MS"] ?? 12_000);
+
+/**
+ * The origin chains a cross-chain deposit can be priced from, and the neutral
+ * refund address 1Click requires per chain. These are placeholders, not the
+ * operator's own address: the card is a simulation, so nothing is ever sent and
+ * nothing can be refunded — the address exists only to satisfy the quote API's
+ * validation. `refundTo` must be a well-formed address on the origin chain.
+ */
+export interface FundingChain {
+  readonly chain: string;
+  /** Asset symbol as 1Click lists it on that chain. */
+  readonly asset: string;
+  readonly symbol: string;
+  readonly label: string;
+  /** A valid, neutral address on this chain; the quote API rejects a blank one. */
+  readonly refundTo: string;
+}
+
+export const FUNDING_CHAINS: readonly FundingChain[] = [
+  {
+    chain: "base",
+    asset: "usdc",
+    symbol: "USDC",
+    label: "Base",
+    refundTo: "0x0000000000000000000000000000000000000001",
+  },
+  {
+    chain: "eth",
+    asset: "usdc",
+    symbol: "USDC",
+    label: "Ethereum",
+    refundTo: "0x0000000000000000000000000000000000000001",
+  },
+  {
+    chain: "arb",
+    asset: "usdc",
+    symbol: "USDC",
+    label: "Arbitrum",
+    refundTo: "0x0000000000000000000000000000000000000001",
+  },
+  {
+    chain: "sol",
+    asset: "usdc",
+    symbol: "USDC",
+    label: "Solana",
+    refundTo: "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
+  },
+];
 
 export type ServiceStatus = "ok" | "down" | "skipped";
 
@@ -44,7 +100,6 @@ export interface ServiceHealth {
 }
 
 export interface LiveHealth {
-  readonly mode: "demo" | "live";
   readonly checkedAt: string;
   readonly services: readonly ServiceHealth[];
   /** True only when every service answered. */
@@ -117,20 +172,20 @@ function timedFetch(): typeof fetch {
  *
  * The wallet is held in memory because provisioning happens at runtime: the
  * operator clicks Connect, and only then does a key exist. Restarting the
- * process forgets it, which is honest for a demo — a persisted wallet belongs
- * behind real storage, not an in-memory field.
+ * process forgets it, which is honest — a persisted wallet belongs behind real
+ * storage, not an in-memory field.
  */
 export class LiveServices {
-  readonly mode: "demo" | "live";
   private readonly fetchImpl: typeof fetch;
   private wallet?: { info: LiveWallet; apiKey: string; handoffUrl?: string };
   private cachedHealth?: { at: number; health: LiveHealth };
   /** Set once a policy has been compiled, so we know it is at least compiled. */
   private compiledPolicy?: CompiledPolicy;
+  /** The live 1Click token list, fetched once on first use. */
+  private assetRegistry?: AssetRegistry;
 
-  constructor(mode?: "demo" | "live") {
-    this.mode = mode ?? ((process.env["CREWPAY_MODE"] ?? "demo") === "live" ? "live" : "demo");
-    this.fetchImpl = timedFetch();
+  constructor(cfg: { fetchImpl?: typeof fetch } = {}) {
+    this.fetchImpl = cfg.fetchImpl ?? timedFetch();
   }
 
   /** The wallet provisioned by a Connect, if any. */
@@ -175,7 +230,6 @@ export class LiveServices {
 
     const services = [oneclick, outlayer, ping];
     const health: LiveHealth = {
-      mode: this.mode,
       checkedAt: new Date().toISOString(),
       services,
       allUp: services.every((s) => s.status === "ok"),
@@ -374,6 +428,108 @@ export class LiveServices {
     if (!res.ok) throw new Error(`balance read failed: HTTP ${res.status}`);
     const body = (await res.json()) as { balance?: string };
     return body.balance ?? "0";
+  }
+
+  /**
+   * Price a cross-chain deposit into the treasury with a real 1Click dry quote.
+   *
+   * This needs no wallet and no partner key, so it is the one Intents path that
+   * is genuinely live. It returns a price and a fee, never a deposit address:
+   * the simulated funding card shows the operator what the corridor would cost,
+   * and stops there. A real deposit address would imply funds can move, and on
+   * this stack they cannot — Intents and 1Click have no testnet.
+   */
+  async fundingQuote(input: {
+    chain: string;
+    amountUsdCents: number;
+    recipient: string;
+  }): Promise<{ preview: QuotePreview; origin: ChainAsset; destination: ChainAsset; chain: FundingChain }> {
+    const chain = FUNDING_CHAINS.find((c) => c.chain === input.chain.toLowerCase());
+    if (!chain) throw new Error(`unsupported funding chain: ${input.chain}`);
+    const registry = await this.registry();
+    const origin: ChainAsset = { chain: chain.chain, asset: chain.asset };
+    // The treasury receives mainnet USDT — the real asset the testnet mock
+    // mirrors. Amount is EXACT_OUTPUT in the origin asset's base units.
+    const destination: ChainAsset = { chain: "near", asset: "usdt" };
+    const amount = registry.toBaseUnits(input.amountUsdCents / 100, chain.chain, chain.symbol);
+    const rail = new OneClickRail({ registry, refundTo: chain.refundTo, fetchImpl: this.fetchImpl });
+    const preview = await rail.preview({
+      origin,
+      destination,
+      amount,
+      recipient: input.recipient,
+      refundTo: chain.refundTo,
+    });
+    return { preview, origin, destination, chain };
+  }
+
+  /** The live 1Click token list, fetched once and reused. */
+  private async registry(): Promise<AssetRegistry> {
+    if (!this.assetRegistry) {
+      this.assetRegistry = await AssetRegistry.fromApi(this.fetchImpl, ONECLICK_URL);
+    }
+    return this.assetRegistry;
+  }
+
+  /**
+   * Price a real customer payment into a NEAR recipient, from any supported
+   * chain, and mint a deposit address the customer sends to. This is the same
+   * 1Click engine as `fundingQuote`, but not dry: the returned address is live
+   * and settles to `recipient`. The customer's own transfer is the only step we
+   * do not perform — everything up to it, and the settlement, is real.
+   */
+  async paymentQuote(input: {
+    originChain: string;
+    amountUsdCents: number;
+    recipient: string;
+  }): Promise<{ quote: DepositQuote; origin: ChainAsset; destination: ChainAsset; chain: FundingChain }> {
+    const chain = FUNDING_CHAINS.find((c) => c.chain === input.originChain.toLowerCase());
+    if (!chain) throw new Error(`unsupported payment chain: ${input.originChain}`);
+    const registry = await this.registry();
+    const origin: ChainAsset = { chain: chain.chain, asset: chain.asset };
+    const destination: ChainAsset = { chain: "near", asset: "usdt" };
+    const amount = registry.toBaseUnits(input.amountUsdCents / 100, chain.chain, chain.symbol);
+    const rail = new OneClickRail({ registry, refundTo: chain.refundTo, fetchImpl: this.fetchImpl });
+    const quote = await rail.depositQuote({
+      origin,
+      destination,
+      amount,
+      recipient: input.recipient,
+      refundTo: chain.refundTo,
+    });
+    return { quote, origin, destination, chain };
+  }
+
+  /** Read a customer payment's status by the deposit address 1Click minted. */
+  async paymentStatus(input: {
+    depositAddress: string;
+    depositMemo?: string;
+  }): Promise<{ status: string; raw: string; txHashes: readonly string[]; refundReason?: string }> {
+    const registry = await this.registry();
+    const rail = new OneClickRail({ registry, refundTo: "0x0000000000000000000000000000000000000001", fetchImpl: this.fetchImpl });
+    return rail.statusByDeposit(input);
+  }
+
+  /**
+   * A keyless price for a cross-chain corridor, for the router's honest
+   * "unreachable, and here is what it would have cost" answer. Uses the live
+   * `dry: true` quote, so it needs no partner key and moves nothing.
+   */
+  crossChainPrice(): PriceSource {
+    return async (input) => {
+      const registry = await this.registry();
+      const rail = new OneClickRail({ registry, refundTo: "0x0000000000000000000000000000000000000001", fetchImpl: this.fetchImpl });
+      const preview = await rail.preview(input);
+      return {
+        correlationId: preview.correlationId,
+        amountIn: preview.amountIn,
+        amountOut: preview.amountOut,
+        ...(preview.amountInUsd ? { amountInUsd: preview.amountInUsd } : {}),
+        ...(preview.amountOutUsd ? { amountOutUsd: preview.amountOutUsd } : {}),
+        ...(preview.withdrawFee ? { withdrawFee: preview.withdrawFee } : {}),
+        ...(typeof preview.timeEstimate === "number" ? { timeEstimate: preview.timeEstimate } : {}),
+      };
+    };
   }
 
   /** The policy the TEE actually enforces — read, never written, by us. */

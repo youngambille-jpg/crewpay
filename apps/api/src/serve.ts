@@ -1,100 +1,101 @@
 /**
- * Serve the control plane over HTTP with a seeded demo org, so the dashboard
- * has something real to read. This is the same `createApi` the tests and the
- * demo drive — it is not a mock.
+ * Serve the control plane over HTTP, live on testnet.
  *
- * Two modes, chosen by `CREWPAY_MODE`:
+ * No seed data, no fake rails: every figure comes from the real API, and money
+ * moves as mock USDT on NEAR testnet through a server-held OutLayer testnet
+ * wallet. The wallet's `wk_` key is persisted to `.data/testnet-wallet.json`
+ * (0600, gitignored) so a restart reuses the same funded account instead of
+ * orphaning the gas sent to it; set CREWPAY_TESTNET_STATE to move or disable
+ * that file. The key never leaves this process otherwise.
  *
- *   demo (default) — the money path runs on `FakeRail`/`FakeSigner`, so it
- *     needs no network and no credentials and the dashboard always has data.
- *     The Connect, health, policy-compile and dry-run endpoints are still real,
- *     because those are what the demo is actually showing.
- *
- *   live — the money path runs on the real adapters: `OneClickRail` with dry
- *     quotes and `OutLayerSigner` against a custody wallet. A real payout then
- *     needs a funded mainnet wallet, which this demo does not have, so a run
- *     stops at `insufficient_balance` and says so. That is the honest outcome,
- *     not a bug.
- *
- * `PORT` defaults to 4000. `PING_API_KEY` and `OUTLAYER_API_KEY` are read from
- * the environment only, and are never logged.
+ * `PORT` defaults to 4000. `CREWPAY_API_TOKEN` is required (no anonymous
+ * payroll). `PING_API_KEY` wires real PingPay checkout and Agent Pay; without
+ * it those routes answer 400 until configured. Nothing here is simulated.
  */
-import { FakeRail, FakePingPay, FakeAgentPay, OneClickRail, AssetRegistry } from "@crewpay/rails";
-import { FakeSigner, OutLayerSigner } from "@crewpay/signer";
+import { AgentPayClient, PingPayClient, Relayer } from "@crewpay/rails";
+import { resolve } from "node:path";
 import { createApi, type ApiDeps } from "./server.ts";
 import { LiveServices } from "./live.ts";
-import { ORG_ID, seedOrg, seedPayRun } from "./seed.ts";
+import { TestnetServices } from "./testnet.ts";
+import type { AuthConfig } from "./auth.ts";
 
 const PORT = Number(process.env.PORT ?? 4000);
 const HOST = process.env.HOST ?? "0.0.0.0";
-const MODE = (process.env.CREWPAY_MODE ?? "demo") === "live" ? "live" : "demo";
-const OUTLAYER_API_KEY = process.env["OUTLAYER_API_KEY"];
 
-const pingpay = new FakePingPay({ webhookSecret: "whsec_dev" });
-const live = new LiveServices(MODE);
+/**
+ * The API holds payroll and the books, so it does not run open. A bearer token
+ * is required and there is no fallback. `CREWPAY_ORG_ID` names the org that
+ * token may act on.
+ */
+const API_TOKEN = process.env["CREWPAY_API_TOKEN"];
+const TOKEN_ORG = process.env["CREWPAY_ORG_ID"] ?? "org_1";
+if (!API_TOKEN) {
+  console.error(
+    "CREWPAY_API_TOKEN is not set. The API serves payroll and the books, so it " +
+      "will not start without a token. Set one, e.g. CREWPAY_API_TOKEN=$(openssl rand -hex 32).",
+  );
+  process.exit(1);
+}
+const auth: AuthConfig = { tokens: new Map([[API_TOKEN, { orgId: TOKEN_ORG, label: TOKEN_ORG }]]) };
 
-/** The money path: real adapters in live mode, deterministic fakes otherwise. */
-function moneyPath(): Pick<ApiDeps, "rail" | "signer"> {
-  if (MODE === "live" && OUTLAYER_API_KEY) {
-    return {
-      rail: new OneClickRail({
-        baseUrl: process.env["ONECLICK_BASE_URL"] ?? "https://1click.chaindefuser.com",
-        registry: AssetRegistry.known(),
-        refundTo: "crewpay.near",
-        // A dry quote prices the corridor without minting a deposit address, so
-        // it needs no partner key. The deposit address comes from the rail once
-        // the wallet is funded.
-        dry: true,
-      }),
-      signer: new OutLayerSigner({
-        apiKey: OUTLAYER_API_KEY,
-        ...(process.env["OUTLAYER_BASE_URL"]
-          ? { baseUrl: process.env["OUTLAYER_BASE_URL"] }
-          : {}),
-      }),
-    };
-  }
-  return {
-    // Slow op 3 and hold op 2 for review so the run is not trivially all-green:
-    // the dashboard must be able to show a mixed result.
-    rail: new FakeRail({ slowOperationIds: ["run_1_op_3"] }),
-    signer: new FakeSigner({ needsReviewOperationIds: ["run_1_op_2"] }),
-  };
+const live = new LiveServices();
+const testnet = new TestnetServices({
+  statePath: process.env["CREWPAY_TESTNET_STATE"] ?? resolve(process.cwd(), ".data/testnet-wallet.json"),
+  // The cross-chain router prices an outbound corridor through this. It is a
+  // keyless 1Click dry quote, so it needs no partner key and moves nothing.
+  priceOutbound: live.crossChainPrice(),
+});
+const { account: testnetAccount, reused: testnetReused } = await testnet.register().catch((err: unknown) => {
+  console.error(
+    `Testnet wallet register failed (this API needs the network): ${err instanceof Error ? err.message : err}`,
+  );
+  process.exit(1);
+});
+const adapters = testnet.adapters();
+if (!adapters) {
+  console.error("Testnet wallet missing right after register; refusing to start half-wired.");
+  process.exit(1);
 }
 
-const { server } = createApi({
-  ...moneyPath(),
-  pingpay,
-  agentpay: new FakeAgentPay({ pendingSettles: 1 }),
-  live,
+const PING_API_KEY = process.env["PING_API_KEY"];
+const pingpay = PING_API_KEY
+  ? new PingPayClient({
+      publishableKey: PING_API_KEY,
+      ...(process.env["PING_WEBHOOK_SECRET"] ? { webhookSecret: process.env["PING_WEBHOOK_SECRET"] } : {}),
+    })
+  : undefined;
+const agentpay = PING_API_KEY
+  ? new AgentPayClient({ apiKey: PING_API_KEY, refundTo: "crewpay.near" })
+  : undefined;
+
+// NEP-366 gas relayer. It sponsors gas for payees who hold no NEAR: the
+// receiver allow-list is the testnet payee account, so the relayer can only
+// forward a delegate action back to that account, never act as a chain-wide
+// gas faucet. The testnet wallet cannot emit Action::Delegate, so a valid
+// delegate action is assembled but not broadcast — the outcome says so.
+const relayer = new Relayer({
+  allowedReceivers: [testnetAccount ?? "crewpay.testnet"],
+  allowedMethods: ["ft_transfer", "transfer"],
 });
+
+const deps: ApiDeps = {
+  auth,
+  rail: adapters.rail,
+  signer: adapters.signer,
+  relayer,
+  ...(pingpay ? { pingpay } : {}),
+  ...(agentpay ? { agentpay } : {}),
+  live,
+  testnet,
+};
+const { server } = createApi(deps);
 
 await new Promise<void>((resolve) => server.listen(PORT, HOST, resolve));
-
-const base = `http://127.0.0.1:${PORT}`;
-const call = async (path: string, method: string, body?: unknown) => {
-  const res = await fetch(base + path, {
-    method,
-    headers: { "content-type": "application/json" },
-    ...(body ? { body: JSON.stringify(body) } : {}),
-  });
-  return { status: res.status, json: (await res.json()) as any };
-};
-
-await seedOrg(call);
-const run = await seedPayRun(call);
-
-// One invoice, so the invoices screen is not empty. Left open on purpose —
-// a paid invoice arrives by webhook, which this process does not fake.
-await call("/v1/invoices", "POST", {
-  orgId: ORG_ID,
-  customerId: "acme-corp",
-  amount: 150_000,
-  autoPayRun: { payeeId: "ada" },
-});
-
-console.log(`crewpay api on ${base} (mode: ${MODE})`);
-console.log(`seeded ${ORG_ID}: ${run?.run?.id ?? "run"} · ${run?.settledCents ?? 0} cents settled`);
-if (MODE === "live" && !OUTLAYER_API_KEY) {
-  console.warn("live mode requested but OUTLAYER_API_KEY is unset; money path is fake");
+console.log(`crewpay api on http://${HOST}:${PORT} (live testnet)`);
+console.log(
+  `testnet wallet: ${testnetAccount} (${testnetReused ? "reused from state" : "freshly minted"})` +
+    ` — needs testnet NEAR gas before it can pay`,
+);
+if (!PING_API_KEY) {
+  console.warn("PING_API_KEY unset; invoices and agent payouts answer 400 until configured");
 }

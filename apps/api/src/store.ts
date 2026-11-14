@@ -1,4 +1,4 @@
-import type { AgentTask, Approval, ChainAsset, Invoice, Operation, OperationStatus, PayRun, PayRunItem, Payee, Policy } from "@crewpay/domain";
+import type { AgentTask, Approval, ChainAsset, Invoice, Operation, OperationStatus, PayRun, PayRunItem, PayRunStatus, Payee, Policy } from "@crewpay/domain";
 import type { JournalEntry } from "@crewpay/ledger";
 import type { Quote } from "@crewpay/rails";
 
@@ -16,6 +16,13 @@ export interface Store {
   invoices: Map<string, Invoice>;
   /** invoiceId -> the pay run to open when the invoice is paid. */
   invoicePayRuns: Map<string, { payeeId: string; origin?: ChainAsset }>;
+  /**
+   * invoiceId -> the 1Click payment session for the public pay page. Kept apart
+   * from the invoice so a re-quote (the deposit address expired) can replace the
+   * session without touching the obligation. `settled` records that the
+   * settlement was applied to the invoice exactly once.
+   */
+  invoicePayments: Map<string, InvoicePayment>;
   /** eventId -> seen marker, so a retried webhook is not acted on twice. */
   webhookEvents: Map<string, { type: string; at: string }>;
   /** Agent tasks, by id. A task is the claim; its payout is the money movement. */
@@ -56,6 +63,28 @@ export interface Store {
 
 /** The policy engine's verdict, restated here so the store stays dependency-free. */
 export type PolicyDecision = "allow" | "allow_with_approval" | "deny";
+
+/**
+ * A 1Click payment session opened from the public pay page. The deposit address
+ * and memo are the customer's instructions; `settled` marks that the settlement
+ * has been applied to the invoice once, so a status re-read cannot double-count.
+ */
+export interface InvoicePayment {
+  readonly invoiceId: string;
+  readonly originChain: string;
+  readonly destinationChain: string;
+  readonly destinationAsset: string;
+  readonly recipient: string;
+  readonly amountOut: string;
+  readonly depositAddress: string;
+  readonly depositMemo?: string;
+  readonly deadline: string;
+  /** 1Click correlation id, for support. */
+  readonly correlationId: string;
+  readonly createdAt: string;
+  settled: boolean;
+  lastStatus?: string;
+}
 
 /**
  * What the loop decided and did with one operation. Written when the operation
@@ -165,6 +194,7 @@ export function createStore(): Store {
     settledTodayCents: new Map(),
     invoices: new Map(),
     invoicePayRuns: new Map(),
+    invoicePayments: new Map(),
     webhookEvents: new Map(),
     agentTasks: new Map(),
     journalEntries: [],
@@ -308,8 +338,37 @@ export function recordOutcome(store: Store, input: OutcomeInput): void {
     const next = [...list];
     next[idx] = { ...current, state: input.status };
     store.payRunItems.set(runId, next);
+    refreshRunStatus(store, runId, next);
     break;
   }
+}
+
+/**
+ * Re-derive a run's status from its current line states. The status written at
+ * creation is a snapshot; once approvals execute, lines move and the stored
+ * status would otherwise keep claiming "awaiting approval" for a run whose
+ * money already moved (or failed to).
+ */
+export function refreshRunStatus(store: Store, runId: string, items: PayRunItem[]): void {
+  const run = store.payRuns.get(runId);
+  if (!run) return;
+  const states = items.map((i) => i.state);
+  const settled = states.filter((s) => s === "settled").length;
+  const open = states.filter(
+    (s) => s === "pending" || s === "awaiting_approval" || s === "approved" || s === "signing" || s === "submitted",
+  ).length;
+  const terminal = items.length - settled - open;
+  let status: PayRunStatus;
+  if (open > 0) {
+    status = settled > 0 ? "partially_settled" : "awaiting_approval";
+  } else if (settled === items.length) {
+    status = "settled";
+  } else if (settled > 0) {
+    status = "partially_settled";
+  } else {
+    status = terminal > 0 ? "failed" : run.status;
+  }
+  if (status !== run.status) store.payRuns.set(runId, { ...run, status });
 }
 
 /** Append one event to the notification outbox. */

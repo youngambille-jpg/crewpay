@@ -125,6 +125,15 @@ test("a successful on-chain transfer proves with tx_hash", async () => {
   if (r.kind === "deposited") assert.equal(r.proof.txHash, "0xabc");
 });
 
+test("a wallet-ops success carries the tx hash top-level (live shape)", async () => {
+  const { fn } = mockFetch([{ body: { request_id: "r1", status: "success", tx_hash: "0xtop", result: {} } }]);
+  const s = signer(fn);
+  const o = op({ origin: { chain: "near", asset: "near" } });
+  const r = await s.fund(o, quote(), s.plan(o, quote()));
+  assert.equal(r.kind, "deposited");
+  if (r.kind === "deposited") assert.equal(r.proof.txHash, "0xtop");
+});
+
 test("success without an identifier is escalated, not treated as funded", async () => {
   const { fn } = mockFetch([{ body: { request_id: "r1", status: "success", result: { amount_out: "150000000" } } }]);
   const s = signer(fn);

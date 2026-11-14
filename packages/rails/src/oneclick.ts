@@ -89,9 +89,59 @@ interface QuoteResponseBody {
     readonly minAmountIn: string;
     readonly amountOut: string;
     readonly minAmountOut: string;
+    readonly amountInFormatted?: string;
+    readonly amountOutFormatted?: string;
+    readonly amountInUsd?: string;
+    readonly amountOutUsd?: string;
+    readonly refundFee?: string;
+    readonly timeEstimate?: number;
     readonly withdrawFee?: string;
     readonly deadline?: string;
   };
+}
+
+/**
+ * A priced corridor, in the display units 1Click reports. This is the raw
+ * material for a funding quote card: what the sender puts in, what the payee
+ * receives, the fee, and how long the swap is expected to take.
+ */
+export interface QuotePreview {
+  readonly correlationId: string;
+  /** Input required on the origin chain, in origin base units (with slippage). */
+  readonly amountIn: string;
+  readonly amountInFormatted?: string;
+  readonly amountInUsd?: string;
+  readonly amountOut: string;
+  readonly amountOutFormatted?: string;
+  readonly amountOutUsd?: string;
+  /** Rail fee retained from the input, in origin base units. */
+  readonly refundFee?: string;
+  readonly withdrawFee?: string;
+  /** Estimated seconds to settle. */
+  readonly timeEstimate?: number;
+  readonly deadline?: string;
+}
+
+/**
+ * A priced corridor with a live deposit address: the customer sends the origin
+ * asset to `depositAddress` and 1Click delivers the destination asset. This is
+ * `QuotePreview` plus the address, so it is the one quote shape that can move
+ * real funds.
+ */
+export interface DepositQuote {
+  readonly correlationId: string;
+  readonly amountIn: string;
+  readonly amountInFormatted?: string;
+  readonly amountInUsd?: string;
+  readonly amountOut: string;
+  readonly amountOutFormatted?: string;
+  readonly amountOutUsd?: string;
+  readonly refundFee?: string;
+  readonly withdrawFee?: string;
+  readonly timeEstimate?: number;
+  readonly deadline: string;
+  readonly depositAddress: string;
+  readonly depositMemo?: string;
 }
 
 interface StatusBody {
@@ -176,6 +226,143 @@ export class OneClickRail implements SettlementRail {
     };
     if (quote.depositMemo) this.memos.set(op.id, quote.depositMemo);
     return quote;
+  }
+
+  /**
+   * Price a corridor without minting a deposit address (`dry: true`). This is
+   * the funding-quote card's data source: a real 1Click price for a real
+   * corridor, with no partner key required and no money at risk. It deliberately
+   * returns no `depositAddress` — the real `quote()` does that, and only a live
+   * run should ever produce an address funds could be sent to.
+   *
+   * `refundTo` must be a valid address on the origin chain (1Click rejects a
+   * blank or malformed one), so callers pass the intended refund address.
+   */
+  async preview(input: {
+    origin: ChainAsset;
+    destination: ChainAsset;
+    amount: bigint;
+    recipient: string;
+    refundTo: string;
+  }): Promise<QuotePreview> {
+    const deadline = new Date(Date.now() + (this.cfg.deadlineMs ?? 3_600_000)).toISOString();
+    const body = {
+      dry: true,
+      depositType: this.cfg.depositType ?? "ORIGIN_CHAIN",
+      swapType: "EXACT_OUTPUT",
+      slippageTolerance: this.cfg.slippageBps ?? 100,
+      originAsset: this.assetId(input.origin),
+      destinationAsset: this.assetId(input.destination),
+      amount: input.amount.toString(),
+      recipient: input.recipient,
+      recipientType: "DESTINATION_CHAIN",
+      refundTo: input.refundTo,
+      refundType: "ORIGIN_CHAIN",
+      deadline,
+    };
+    const res = await this.fetch(`${this.baseUrl}/v0/quote`, {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new RailError(this.name, res.status, await errorMessage(res));
+    const json = (await res.json()) as QuoteResponseBody;
+    const q = json.quote;
+    return {
+      correlationId: json.correlationId,
+      amountIn: q.amountIn,
+      ...(q.amountInFormatted ? { amountInFormatted: q.amountInFormatted } : {}),
+      ...(q.amountInUsd ? { amountInUsd: q.amountInUsd } : {}),
+      amountOut: q.amountOut,
+      ...(q.amountOutFormatted ? { amountOutFormatted: q.amountOutFormatted } : {}),
+      ...(q.amountOutUsd ? { amountOutUsd: q.amountOutUsd } : {}),
+      ...(q.refundFee ? { refundFee: q.refundFee } : {}),
+      ...(q.withdrawFee ? { withdrawFee: q.withdrawFee } : {}),
+      ...(typeof q.timeEstimate === "number" ? { timeEstimate: q.timeEstimate } : {}),
+      deadline: q.deadline ?? deadline,
+    };
+  }
+
+  /**
+   * A real quote that mints a deposit address (`dry: false`). This is the
+   * customer-facing payment path: the customer sends the origin asset to
+   * `depositAddress`, and 1Click settles the destination asset to `recipient`.
+   * Unlike `preview`, money can actually move to the returned address, so this
+   * is only ever called to start a real payment.
+   */
+  async depositQuote(input: {
+    origin: ChainAsset;
+    destination: ChainAsset;
+    amount: bigint;
+    recipient: string;
+    refundTo: string;
+  }): Promise<DepositQuote> {
+    const deadline = new Date(Date.now() + (this.cfg.deadlineMs ?? 3_600_000)).toISOString();
+    const body = {
+      dry: false,
+      depositType: this.cfg.depositType ?? "ORIGIN_CHAIN",
+      swapType: "EXACT_OUTPUT",
+      slippageTolerance: this.cfg.slippageBps ?? 100,
+      originAsset: this.assetId(input.origin),
+      destinationAsset: this.assetId(input.destination),
+      amount: input.amount.toString(),
+      recipient: input.recipient,
+      recipientType: "DESTINATION_CHAIN",
+      refundTo: input.refundTo,
+      refundType: "ORIGIN_CHAIN",
+      deadline,
+    };
+    const res = await this.fetch(`${this.baseUrl}/v0/quote`, {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new RailError(this.name, res.status, await errorMessage(res));
+    const json = (await res.json()) as QuoteResponseBody;
+    const q = json.quote;
+    return {
+      correlationId: json.correlationId,
+      amountIn: q.amountIn,
+      ...(q.amountInFormatted ? { amountInFormatted: q.amountInFormatted } : {}),
+      ...(q.amountInUsd ? { amountInUsd: q.amountInUsd } : {}),
+      amountOut: q.amountOut,
+      ...(q.amountOutFormatted ? { amountOutFormatted: q.amountOutFormatted } : {}),
+      ...(q.amountOutUsd ? { amountOutUsd: q.amountOutUsd } : {}),
+      ...(q.refundFee ? { refundFee: q.refundFee } : {}),
+      ...(q.withdrawFee ? { withdrawFee: q.withdrawFee } : {}),
+      ...(typeof q.timeEstimate === "number" ? { timeEstimate: q.timeEstimate } : {}),
+      deadline: q.deadline ?? deadline,
+      depositAddress: q.depositAddress,
+      ...(q.depositMemo ? { depositMemo: q.depositMemo } : {}),
+    };
+  }
+
+  /**
+   * Read a swap's status by its deposit address. Returns the normalized state
+   * and any destination-chain transaction hashes, so a paid invoice can be
+   * traced to a real transaction.
+   */
+  async statusByDeposit(input: { depositAddress: string; depositMemo?: string }): Promise<{
+    status: SettlementStatus;
+    raw: string;
+    txHashes: readonly string[];
+    refundReason?: string;
+  }> {
+    const params = new URLSearchParams({ depositAddress: input.depositAddress });
+    if (input.depositMemo) params.set("depositMemo", input.depositMemo);
+    const res = await this.fetch(`${this.baseUrl}/v0/status?${params.toString()}`, {
+      method: "GET",
+      headers: this.headers(),
+    });
+    if (!res.ok) throw new RailError(this.name, res.status, await errorMessage(res));
+    const json = (await res.json()) as StatusBody;
+    const txHashes = (json.swapDetails?.destinationChainTxHashes ?? []).map((h) => h.hash);
+    return {
+      status: mapStatus(json.status),
+      raw: json.status,
+      txHashes,
+      ...(json.swapDetails?.refundReason ? { refundReason: json.swapDetails.refundReason } : {}),
+    };
   }
 
   /**

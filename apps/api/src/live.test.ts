@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
 import { FakeRail, FakePingPay, FakeAgentPay } from "@crewpay/rails";
 import { createApi } from "./server.ts";
+import { TEST_TOKEN, testAuth } from "./auth.ts";
 import { toOutLayerRules, type LiveServices } from "./live.ts";
 
 const KEY = "wk_testkeymustnotleak0123456789";
@@ -20,11 +21,9 @@ function stubLive(): LiveServices {
     createdAt: new Date().toISOString(),
   };
   return {
-    mode: "demo",
     connected: wallet,
     handoffUrl: HANDOFF,
     health: async () => ({
-      mode: "demo" as const,
       checkedAt: new Date().toISOString(),
       services: [
         { name: "1Click", status: "ok" as const, detail: "231 assets", ms: 12 },
@@ -54,6 +53,7 @@ function stubLive(): LiveServices {
 
 async function start(live?: LiveServices) {
   const { server } = createApi({
+    auth: testAuth(),
     rail: new FakeRail(),
     pingpay: new FakePingPay({ webhookSecret: "whsec_dev" }),
     agentpay: new FakeAgentPay(),
@@ -65,26 +65,29 @@ async function start(live?: LiveServices) {
   const call = async (path: string, method: string, body?: unknown) => {
     const res = await fetch(url + path, {
       method,
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", authorization: `Bearer ${TEST_TOKEN}` },
       ...(body ? { body: JSON.stringify(body) } : {}),
     });
     return { status: res.status, text: await res.text() };
   };
   /** A GET that must not follow the redirect, so Location can be inspected. */
   const redirect = async (path: string) => {
-    const res = await fetch(url + path, { redirect: "manual" });
+    const res = await fetch(url + path, {
+      redirect: "manual",
+      headers: { authorization: `Bearer ${TEST_TOKEN}` },
+    });
     return { status: res.status, location: res.headers.get("location") };
   };
   return { server, call, redirect };
 }
 
-test("health reports demo with no live services configured", async () => {
+test("health reports no services when live services are not configured", async () => {
   const { server, call } = await start();
   try {
     const { status, text } = await call("/v1/live/health", "GET");
     assert.equal(status, 200);
     const body = JSON.parse(text);
-    assert.equal(body.mode, "demo");
+    assert.equal(body.allUp, false);
     assert.deepEqual(body.services, []);
   } finally {
     server.close();

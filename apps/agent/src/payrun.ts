@@ -99,6 +99,17 @@ export async function settleOperation(
   operation: Operation,
   deps: Pick<RunDeps, "rail" | "signer">,
 ): Promise<SettlementOutcome> {
+  // Refuse an unreachable corridor before quoting or funding. A rail that only
+  // reaches part of the corridor says so here, and stopping now is what keeps
+  // an uncompletable payment from leaving an orphaned deposit on-chain.
+  const preflight = deps.rail.preflight?.(operation);
+  if (preflight && !preflight.ok) {
+    return {
+      kind: "failed",
+      settlement: { operationId: operation.id, status: "failed", failureReason: preflight.reason },
+    };
+  }
+
   const quote = await deps.rail.quote(operation);
 
   let proof: DepositProof | undefined;

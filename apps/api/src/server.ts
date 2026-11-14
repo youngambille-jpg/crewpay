@@ -4,6 +4,7 @@ import type {
   Approval,
   ChainAsset,
   Invoice,
+  InvoiceLineItem,
   InvoiceStatus,
   Operation,
   PayRun,
@@ -14,17 +15,26 @@ import type {
   Policy,
   UsdCents,
 } from "@crewpay/domain";
-import { defaultRules, corridor, invoiceStatusFor } from "@crewpay/domain";
-import type { AgentPayPort, PingPayPort, SettlementRail } from "@crewpay/rails";
+import { defaultRules, corridor, invoiceStatusFor, invoiceStatusForPayment, lineItemAmount } from "@crewpay/domain";
+import type { AgentPayPort, PingPayPort, Relayer, SettlementRail } from "@crewpay/rails";
 import type { Signer } from "@crewpay/signer";
 import { compileManifest, diffManifest, type ManifestDrift } from "@crewpay/signer";
 import { executeApproved, executeRun, payAgentTask, resolveFunding } from "@crewpay/agent";
 import { allBalanced, attestation, trialBalance } from "@crewpay/ledger";
-import { activePolicy, createStore, notify, recordFunding, recordOutcome, resolveFundingRecord, type Store } from "./store.ts";
-import { LiveServices, toOutLayerRules } from "./live.ts";
+import { activePolicy, createStore, notify, recordFunding, recordOutcome, resolveFundingRecord, type InvoicePayment, type Store } from "./store.ts";
+import { FUNDING_CHAINS, LiveServices, toOutLayerRules } from "./live.ts";
+import { resolvePrincipal, type AuthConfig, type Principal } from "./auth.ts";
+import type { TestnetServices } from "./testnet.ts";
 
 export interface ApiDeps {
   readonly rail: SettlementRail;
+  /**
+   * Who may call this API, and as which org. Required: there is no default,
+   * because a default would mean the deployed API silently answers anonymous
+   * callers. `serve.ts` builds it from the environment and refuses to start
+   * without a token.
+   */
+  readonly auth: AuthConfig;
   /** Funds the rail's deposit address. Without it, runs are unfunded. */
   readonly signer?: Signer;
   /** Ping checkout + webhook verification. Without it, invoices are off. */
@@ -38,6 +48,54 @@ export interface ApiDeps {
    * path is fake, so an operator can always see the true state of the rails.
    */
   readonly live?: LiveServices;
+  /**
+   * Testnet payout services (OutLayer testnet wallet + mock-USDT adapters).
+   * Without it the /v1/testnet/* endpoints answer 400. The wallet key lives in
+   * this holder only and is never returned to a caller.
+   */
+  readonly testnet?: TestnetServices;
+  /**
+   * NEP-366 gas relayer. Present when the deployment sponsors gas for payees
+   * who hold none: a payee (or agent) signs a delegate action, the relayer
+   * validates it and assembles the outer transaction. Without it, the
+   * `/v1/relay` route answers 400.
+   */
+  readonly relayer?: Relayer;
+}
+
+/**
+ * A request that has been authenticated, carrying the caller's org.
+ *
+ * Handlers take this instead of reading `orgId` from the request. The org a
+ * caller may act on is a property of the caller, so it is resolved once, here,
+ * and cannot be overridden by a query string or body field.
+ */
+interface Access {
+  readonly principal: Principal;
+  /**
+   * The org to act on. Returns the caller's own org when none was requested,
+   * and `undefined` when a *different* org was named — the caller must then be
+   * told 404, not 403, so the API never confirms that another org's data
+   * exists.
+   */
+  org(requested?: string | null): string | undefined;
+}
+
+function accessFor(principal: Principal): Access {
+  return {
+    principal,
+    org(requested) {
+      if (requested === null || requested === undefined || requested === "") {
+        return principal.orgId;
+      }
+      return requested === principal.orgId ? principal.orgId : undefined;
+    },
+  };
+}
+
+/** The caller may not see or touch this resource. 404, never 403. */
+function notFound(res: ServerResponse): void {
+  send(res, 404, { error: "not found" });
 }
 
 interface PayRunRequest {
@@ -87,10 +145,32 @@ function send(res: ServerResponse, status: number, body: unknown): void {
     // handlers have no auth yet, so this is dev-grade: once auth lands, the
     // origin must be pinned and credentials sent explicitly.
     "access-control-allow-origin": "*",
-    "access-control-allow-headers": "content-type, x-ping-signature, x-ping-timestamp",
+    "access-control-allow-headers": "authorization, content-type, x-ping-signature, x-ping-timestamp",
     "access-control-allow-methods": "GET, POST, OPTIONS",
   });
   res.end(payload);
+}
+
+/**
+ * Write a CSV attachment. Values are quoted only when they must be (RFC 4180),
+ * and a leading `=`, `+`, `-` or `@` is prefixed with a quote so a spreadsheet
+ * cannot interpret a memo as a formula — a bookkeeper's export should never
+ * execute anything.
+ */
+function sendCsv(res: ServerResponse, filename: string, rows: readonly (readonly string[])[]): void {
+  const body = rows.map((row) => row.map(csvCell).join(",")).join("\r\n") + "\r\n";
+  res.writeHead(200, {
+    "content-type": "text/csv; charset=utf-8",
+    "content-disposition": `attachment; filename="${filename}"`,
+    "access-control-allow-origin": "*",
+  });
+  res.end(body);
+}
+
+function csvCell(value: string): string {
+  const needsFormulaGuard = /^[=+\-@\t\r]/.test(value);
+  const guarded = needsFormulaGuard ? `'${value}` : value;
+  return /[",\r\n]/.test(guarded) ? `"${guarded.replace(/"/g, '""')}"` : guarded;
 }
 
 /**
@@ -102,6 +182,7 @@ async function createPayRun(
   store: Store,
   deps: ApiDeps,
   body: PayRunRequest & { source?: PayRunSource; sourceRef?: string },
+  via?: { rail: SettlementRail; signer?: Signer },
 ): Promise<Record<string, unknown> | { error: string }> {
   const policy = activePolicy(store, body.orgId);
   if (!policy) return { error: "no active policy for org" };
@@ -111,9 +192,18 @@ async function createPayRun(
   const items: { item: PayRunItem; operation: Operation }[] = [];
   let total = 0n;
 
-  body.lines.forEach((line, i) => {
+  // Resolve every line's payee before touching the rail. A payee that belongs
+  // to another org is as unknown as one that does not exist: paying it would
+  // move the caller's money to a destination they were never granted.
+  for (const line of body.lines) {
     const payee = store.payees.get(line.payeeId);
-    if (!payee) throw new Error(`unknown payee ${line.payeeId}`);
+    if (!payee || payee.orgId !== body.orgId) {
+      return { error: `unknown payee ${line.payeeId}` };
+    }
+  }
+
+  body.lines.forEach((line, i) => {
+    const payee = store.payees.get(line.payeeId)!;
     const operation: Operation = {
       id: `${runId}_op_${i + 1}`,
       orgId: body.orgId,
@@ -142,13 +232,15 @@ async function createPayRun(
     total += operation.amount.amount;
   });
 
+  const rail = via?.rail ?? deps.rail;
+  const signer = via?.signer ?? deps.signer;
   const result = await executeRun(
     body.orgId,
     policy,
     items,
     {
-      rail: deps.rail,
-      ...(deps.signer ? { signer: deps.signer } : {}),
+      rail,
+      ...(signer ? { signer } : {}),
       lookupPayee: (id) => store.payees.get(id),
       payeeHasHistory: (id) => (store.payeeHistory.get(id) ?? 0) > 0,
       // The daily cap is per day, not per run: seed it with what already settled.
@@ -355,7 +447,7 @@ async function handle(
   if (method === "OPTIONS") {
     res.writeHead(204, {
       "access-control-allow-origin": "*",
-      "access-control-allow-headers": "content-type, x-ping-signature, x-ping-timestamp",
+      "access-control-allow-headers": "authorization, content-type, x-ping-signature, x-ping-timestamp",
       "access-control-allow-methods": "GET, POST, OPTIONS",
       "access-control-max-age": "86400",
     });
@@ -371,11 +463,46 @@ async function handle(
   // so the landing page and the dashboard can both show live infrastructure
   // rather than a hard-coded "all systems go".
   if (method === "GET" && url.pathname === "/v1/live/health") {
-    if (!deps.live) return send(res, 200, { mode: "demo", services: [], allUp: false });
+    if (!deps.live) return send(res, 200, { services: [], allUp: false });
     const force = url.searchParams.get("refresh") === "1";
     const health = await deps.live.health(force ? 0 : 30_000);
     return send(res, 200, health);
   }
+
+  // Ping's webhook authenticates with an HMAC over the raw body, not a token,
+  // so it is answered here. Everything below this point requires a principal.
+  if (method === "POST" && url.pathname === "/v1/webhooks/pingpay") {
+    return handlePingWebhook(req, res, store, deps);
+  }
+
+  // Public pay page. The invoice id is the capability: whoever holds the link
+  // may see the amount and pay it. No org data, no other invoice, no policy, no
+  // bearer token — just this one obligation and how to settle it.
+  if (method === "GET" && url.pathname.startsWith("/v1/pay/")) {
+    const rest = decodeURIComponent(url.pathname.slice("/v1/pay/".length));
+    if (rest.endsWith("/status")) {
+      const invoiceId = rest.slice(0, -"/status".length);
+      return publicInvoiceStatus(res, store, deps, invoiceId);
+    }
+    return publicInvoiceView(res, store, deps, rest);
+  }
+
+  if (method === "POST" && url.pathname.startsWith("/v1/pay/") && url.pathname.endsWith("/quote")) {
+    const invoiceId = decodeURIComponent(url.pathname.slice("/v1/pay/".length, -"/quote".length));
+    const body = (await readJson(req)) as { originChain?: string; amountUsdCents?: number };
+    return publicInvoiceQuote(res, store, deps, invoiceId, body);
+  }
+
+  // The gate. A request without a valid token is answered here and can never
+  // reach a handler that reads or writes money — the routing below is reachable
+  // only with a principal in hand. This is why the check is one branch rather
+  // than a call inside every handler: a handler added later is protected by
+  // default instead of by remembering to protect it.
+  const principal = resolvePrincipal(req, deps.auth);
+  if (!principal) {
+    return send(res, 401, { error: "authentication required" });
+  }
+  const access = accessFor(principal);
 
   // Provision a real custody wallet. This is the demo's "connect" step: it mints
   // a real OutLayer wallet with a real `wk_` key. The key stays in this process;
@@ -503,23 +630,31 @@ async function handle(
 
   if (method === "POST" && url.pathname === "/v1/payees") {
     const body = (await readJson(req)) as Payee;
-    store.payees.set(body.id, body);
-    if (!store.payeeHistory.has(body.id)) store.payeeHistory.set(body.id, 0);
-    return send(res, 201, body);
+    // The org is the caller's, not the body's: a caller cannot file a payee
+    // into someone else's org by naming it.
+    const payee: Payee = { ...body, orgId: access.principal.orgId };
+    store.payees.set(payee.id, payee);
+    if (!store.payeeHistory.has(payee.id)) store.payeeHistory.set(payee.id, 0);
+    return send(res, 201, payee);
   }
 
   if (method === "GET" && url.pathname === "/v1/payees") {
-    const orgId = url.searchParams.get("orgId");
-    const all = [...store.payees.values()].filter((p) => !orgId || p.orgId === orgId);
+    // Previously an omitted `orgId` returned every org's payees. Now the caller
+    // sees their own org, and naming another org is a 404.
+    const orgId = access.org(url.searchParams.get("orgId"));
+    if (!orgId) return notFound(res);
+    const all = [...store.payees.values()].filter((p) => p.orgId === orgId);
     return send(res, 200, all);
   }
 
   if (method === "POST" && url.pathname === "/v1/policies") {
-    const body = (await readJson(req)) as Partial<Policy> & { orgId: string };
-    const previous = activePolicy(store, body.orgId);
+    const body = (await readJson(req)) as Partial<Policy> & { orgId?: string };
+    const requested = access.org(body.orgId);
+    if (!requested) return notFound(res);
+    const previous = activePolicy(store, requested);
     const policy: Policy = {
       id: body.id ?? `pol_${store.policies.size + 1}`,
-      orgId: body.orgId,
+      orgId: requested,
       // Each POST publishes a new version, so a decision can always be traced
       // to the rules in force when it was made.
       version: body.version ?? (previous ? previous.version + 1 : 1),
@@ -536,8 +671,8 @@ async function handle(
   }
 
   if (method === "GET" && url.pathname === "/v1/policies") {
-    const orgId = url.searchParams.get("orgId");
-    if (!orgId) return send(res, 400, { error: "orgId is required" });
+    const orgId = access.org(url.searchParams.get("orgId"));
+    if (!orgId) return notFound(res);
     // The active policy only: superseded versions exist to make past decisions
     // replayable, not to be edited.
     const policy = activePolicy(store, orgId);
@@ -547,19 +682,22 @@ async function handle(
 
   if (method === "POST" && url.pathname === "/v1/pay-runs") {
     const body = (await readJson(req)) as PayRunRequest;
-    const result = await createPayRun(store, deps, body);
+    const orgId = access.org(body.orgId);
+    if (!orgId) return notFound(res);
+    const result = await createPayRun(store, deps, { ...body, orgId });
     if ("error" in result) return send(res, 400, result);
     return send(res, 201, result);
   }
 
   if (method === "GET" && url.pathname === "/v1/pay-runs") {
-    const orgId = url.searchParams.get("orgId");
+    const orgId = access.org(url.searchParams.get("orgId"));
+    if (!orgId) return notFound(res);
     // Newest first, each run carrying its lines so a caller can render progress
     // without a second request per run. Ties on createdAt (two runs created in
     // the same millisecond) break on insertion order, newest last-inserted
     // first, so the order is deterministic rather than left to the Map.
     const runs = [...store.payRuns.entries()]
-      .filter(([, r]) => !orgId || r.orgId === orgId)
+      .filter(([, r]) => r.orgId === orgId)
       .map(([id, run], index) => ({ run, id, index }))
       .sort((a, b) =>
         b.run.createdAt.localeCompare(a.run.createdAt) || b.index - a.index,
@@ -571,16 +709,50 @@ async function handle(
   if (method === "POST" && url.pathname === "/v1/invoices") {
     if (!deps.pingpay) return send(res, 400, { error: "no pingpay client configured" });
     const body = (await readJson(req)) as {
-      orgId: string;
+      orgId?: string;
       customerId: string;
       amount: UsdCents;
+      lineItems?: readonly { description?: string; quantity?: number; unitAmount?: number }[];
+      dueDate?: string;
       settlementAsset?: ChainAsset;
       successUrl?: string;
       cancelUrl?: string;
       /** Optional: open the pay run the moment the invoice is paid. */
       autoPayRun?: { payeeId: string; origin?: ChainAsset };
     };
+    const orgId = access.org(body.orgId);
+    if (!orgId) return notFound(res);
     const asset = body.settlementAsset ?? { chain: "near", asset: "usdc" };
+
+    // Line items are optional, but a malformed one is refused rather than
+    // silently dropped: a total that disagrees with its lines is worse than no
+    // breakdown at all for the bookkeeper reading the export.
+    let lineItems: InvoiceLineItem[] | undefined;
+    if (body.lineItems && body.lineItems.length > 0) {
+      lineItems = [];
+      for (const raw of body.lineItems) {
+        const description = (raw.description ?? "").trim();
+        const quantity = raw.quantity ?? 1;
+        const unitAmount = raw.unitAmount ?? 0;
+        if (!description) return send(res, 400, { error: "every line item needs a description" });
+        if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+          return send(res, 400, { error: "line item quantity must be a positive integer" });
+        }
+        if (!Number.isSafeInteger(unitAmount) || unitAmount < 0) {
+          return send(res, 400, { error: "line item unitAmount must be a non-negative integer (cents)" });
+        }
+        lineItems.push({ description, quantity, unitAmount, amount: lineItemAmount(quantity, unitAmount) });
+      }
+      const sum = lineItems.reduce((total, line) => total + line.amount, 0);
+      if (sum !== body.amount) {
+        return send(res, 400, { error: `line items sum to ${sum} cents, but the amount is ${body.amount}` });
+      }
+    }
+
+    if (body.dueDate !== undefined && Number.isNaN(Date.parse(body.dueDate))) {
+      return send(res, 400, { error: "dueDate must be an ISO date" });
+    }
+
     const session = await deps.pingpay.createCheckout({
       amount: body.amount,
       asset,
@@ -590,9 +762,11 @@ async function handle(
     });
     const invoice: Invoice = {
       id: `inv_${store.invoices.size + 1}`,
-      orgId: body.orgId,
+      orgId,
       customerId: body.customerId,
       amount: body.amount,
+      ...(lineItems ? { lineItems } : {}),
+      ...(body.dueDate ? { dueDate: body.dueDate } : {}),
       settlementAsset: asset,
       status: invoiceStatusFor(session.status),
       checkoutSessionId: session.sessionId,
@@ -613,83 +787,12 @@ async function handle(
   }
 
   if (method === "GET" && url.pathname === "/v1/invoices") {
-    const orgId = url.searchParams.get("orgId");
+    const orgId = access.org(url.searchParams.get("orgId"));
+    if (!orgId) return notFound(res);
     const all = [...store.invoices.values()]
-      .filter((i) => !orgId || i.orgId === orgId)
+      .filter((i) => i.orgId === orgId)
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     return send(res, 200, all);
-  }
-
-  if (method === "POST" && url.pathname === "/v1/webhooks/pingpay") {
-    if (!deps.pingpay) return send(res, 400, { error: "no pingpay client configured" });
-    // The raw body is what the signature covers. Re-serialising parsed JSON
-    // would change whitespace and key order and break the HMAC.
-    const raw = await readRaw(req);
-    const event = deps.pingpay.verifyWebhook(raw, {
-      ...(typeof req.headers["x-ping-signature"] === "string"
-        ? { signature: req.headers["x-ping-signature"] }
-        : {}),
-      ...(typeof req.headers["x-ping-timestamp"] === "string"
-        ? { timestamp: req.headers["x-ping-timestamp"] }
-        : {}),
-    }) as unknown as PingWebhookEvent;
-
-    // Ping retries until it gets a 2xx, so the same event can arrive twice.
-    // Acknowledging a duplicate without acting is what makes that safe.
-    if (store.webhookEvents.has(event.id)) {
-      return send(res, 200, { received: true, duplicate: true, eventId: event.id });
-    }
-    store.webhookEvents.set(event.id, { type: event.type, at: new Date().toISOString() });
-
-    const invoice = [...store.invoices.values()].find(
-      (i) => i.checkoutSessionId === event.resourceId || i.paymentId === event.resourceId,
-    );
-    if (!invoice) {
-      // Nothing of ours matches. Acknowledge so Ping stops retrying, but say so.
-      return send(res, 200, { received: true, matched: false, eventId: event.id });
-    }
-
-    if (event.type === "checkout.session.completed") {
-      // The webhook is a claim; the session is the truth. Ask Ping before
-      // releasing money, so a forged-but-signed-elsewhere or replayed event
-      // cannot mark an unpaid invoice as paid.
-      const session = await deps.pingpay.getCheckout(invoice.checkoutSessionId);
-      const status = invoiceStatusFor(session.status);
-      const updated: Invoice = {
-        ...invoice,
-        status,
-        ...(session.paymentId ? { paymentId: session.paymentId } : {}),
-        ...(status === "paid" ? { paidAt: new Date().toISOString() } : {}),
-      };
-      store.invoices.set(invoice.id, updated);
-
-      if (status !== "paid") {
-        return send(res, 200, { received: true, invoice: updated, note: "session not completed at Ping" });
-      }
-
-      const auto = store.invoicePayRuns.get(invoice.id);
-      if (!auto) return send(res, 200, { received: true, invoice: updated });
-
-      // Paid: open the pay run that pays the contractor out of the proceeds.
-      const payRun = await createPayRun(store, deps, {
-        orgId: invoice.orgId,
-        period: new Date().toISOString().slice(0, 7),
-        source: "invoice",
-        sourceRef: invoice.id,
-        origin: auto.origin ?? invoice.settlementAsset,
-        lines: [{ payeeId: auto.payeeId, usdCents: invoice.amount }],
-      });
-      return send(res, 200, { received: true, invoice: updated, payRun });
-    }
-
-    if (event.type === "checkout.session.expired" || event.type === "payment.failed") {
-      const status: InvoiceStatus = event.type === "payment.failed" ? "failed" : "expired";
-      const updated: Invoice = { ...invoice, status };
-      store.invoices.set(invoice.id, updated);
-      return send(res, 200, { received: true, invoice: updated });
-    }
-
-    return send(res, 200, { received: true, ignored: event.type, eventId: event.id });
   }
 
   // One run with its lines, each line carrying its decision record and, once
@@ -698,7 +801,9 @@ async function handle(
     const id = decodeURIComponent(url.pathname.slice("/v1/pay-runs/".length));
     if (!id || id.includes("/")) return send(res, 404, { error: "not found" });
     const run = store.payRuns.get(id);
-    if (!run) return send(res, 404, { error: "run not found" });
+    // A run belonging to another org is reported as absent, not forbidden: a
+    // 403 would confirm the id exists.
+    if (!run || run.orgId !== access.principal.orgId) return send(res, 404, { error: "run not found" });
     const items = (store.payRunItems.get(id) ?? []).map((item) => {
       const record = item.operationId ? store.operationRecords.get(item.operationId) : undefined;
       const receipt = item.operationId ? store.receipts.get(item.operationId) : undefined;
@@ -709,10 +814,11 @@ async function handle(
 
   // Every operation with its policy decision and settlement state.
   if (method === "GET" && url.pathname === "/v1/operations") {
-    const orgId = url.searchParams.get("orgId");
+    const orgId = access.org(url.searchParams.get("orgId"));
+    if (!orgId) return notFound(res);
     const status = url.searchParams.get("status");
     const rows = [...store.operations.values()]
-      .filter((op) => !orgId || op.orgId === orgId)
+      .filter((op) => op.orgId === orgId)
       .map((operation) => {
         const record = store.operationRecords.get(operation.id);
         if (status && record?.status !== status) return null;
@@ -725,14 +831,15 @@ async function handle(
 
   // The notification outbox: who was told what, and about which money.
   if (method === "GET" && url.pathname === "/v1/notifications") {
-    const orgId = url.searchParams.get("orgId");
-    const all = store.notifications.filter((n) => !orgId || n.orgId === orgId);
+    const orgId = access.org(url.searchParams.get("orgId"));
+    if (!orgId) return notFound(res);
+    const all = store.notifications.filter((n) => n.orgId === orgId);
     return send(res, 200, all);
   }
 
   if (method === "GET" && url.pathname === "/v1/manifest") {
-    const orgId = url.searchParams.get("orgId");
-    if (!orgId) return send(res, 400, { error: "orgId is required" });
+    const orgId = access.org(url.searchParams.get("orgId"));
+    if (!orgId) return notFound(res);
     const policy = activePolicy(store, orgId);
     if (!policy) return send(res, 400, { error: "no active policy for org" });
 
@@ -777,9 +884,10 @@ async function handle(
     // where funds may have moved and the outcome we recorded is only a snapshot.
     // Resolved records are filtered out — the list exists to show what still
     // needs a human, and an answered question does not.
-    const orgId = url.searchParams.get("orgId");
+    const orgId = access.org(url.searchParams.get("orgId"));
+    if (!orgId) return notFound(res);
     const rows = [...store.fundingRequests.values()].filter(
-      (r) => !r.resolution && (!orgId || r.orgId === orgId),
+      (r) => !r.resolution && r.orgId === orgId,
     );
     return send(res, 200, rows);
   }
@@ -790,7 +898,9 @@ async function handle(
     // this never re-submits, however the request looks.
     const requestId = decodeURIComponent(url.pathname.slice("/v1/custody/requests/".length));
     const record = store.fundingRequests.get(requestId);
-    if (!record) return send(res, 404, { error: "unknown funding request" });
+    if (!record || record.orgId !== access.principal.orgId) {
+      return send(res, 404, { error: "unknown funding request" });
+    }
     if (!deps.signer?.reconcile) {
       return send(res, 400, { error: "no reconciling signer configured", record });
     }
@@ -802,7 +912,12 @@ async function handle(
   if (method === "POST" && resolveMatch) {
     const requestId = decodeURIComponent(resolveMatch[1]!);
     const record = store.fundingRequests.get(requestId);
-    if (!record) return send(res, 404, { error: "unknown funding request" });
+    // Another org's funding request is invisible here, and it must be: resolving
+    // re-reads the rail and can book a settlement, so an unowned id is a write
+    // against someone else's books.
+    if (!record || record.orgId !== access.principal.orgId) {
+      return send(res, 404, { error: "unknown funding request" });
+    }
     if (!deps.signer?.reconcile) {
       return send(res, 400, { error: "no reconciling signer configured", record });
     }
@@ -933,11 +1048,146 @@ async function handle(
     });
   }
 
+  // Testnet wallet: register (or reuse) the server-held OutLayer testnet
+  // wallet. The key never leaves this process; callers get the account id and
+  // read its on-chain state through the status endpoint below.
+  if (method === "POST" && url.pathname === "/v1/testnet/wallet") {
+    if (!deps.testnet) return send(res, 400, { error: "testnet services not configured" });
+    try {
+      const { account, reused } = await deps.testnet.register();
+      return send(res, reused ? 200 : 201, { connected: true, account, reused });
+    } catch (err) {
+      return send(res, 502, { error: err instanceof Error ? err.message : "register failed" });
+    }
+  }
+
+  if (method === "GET" && url.pathname === "/v1/testnet/wallet") {
+    if (!deps.testnet) return send(res, 400, { error: "testnet services not configured" });
+    return send(res, 200, await deps.testnet.status());
+  }
+
+  // Prepare a payout: report gas, register the wallet, mint mock USDT, and
+  // register the recipient. Steps run once each; repeats report rather than
+  // re-spend. Never throws for an unfunded wallet — it reports what is missing.
+  if (method === "POST" && url.pathname === "/v1/testnet/prepare") {
+    if (!deps.testnet) return send(res, 400, { error: "testnet services not configured" });
+    const body = (await readJson(req)) as { recipient?: string; minUsdtBase?: string };
+    if (!body.recipient) return send(res, 400, { error: "recipient is required" });
+    let min = 0n;
+    try {
+      min = BigInt(body.minUsdtBase ?? "0");
+    } catch {
+      return send(res, 400, { error: "minUsdtBase must be an integer string" });
+    }
+    try {
+      return send(res, 200, await deps.testnet.prepare(body.recipient, min));
+    } catch (err) {
+      return send(res, 409, { error: err instanceof Error ? err.message : "prepare failed" });
+    }
+  }
+
+  // Mint mock USDT.e to the held testnet wallet. The console's faucet: a real
+  // on-chain mint of the fakes token, so the wallet can pay out before a pay
+  // run. Gas is a human step (only a human can send the first NEAR); without it
+  // the route reports what is missing rather than failing opaquely.
+  if (method === "POST" && url.pathname === "/v1/testnet/mint") {
+    if (!deps.testnet) return send(res, 400, { error: "testnet services not configured" });
+    const body = (await readJson(req)) as { amountBase?: string };
+    let amount: bigint | undefined;
+    if (body.amountBase !== undefined) {
+      try {
+        amount = BigInt(body.amountBase);
+      } catch {
+        return send(res, 400, { error: "amountBase must be an integer string" });
+      }
+      if (amount <= 0n) return send(res, 400, { error: "amountBase must be positive" });
+    }
+    try {
+      return send(res, 200, await deps.testnet.mint(amount));
+    } catch (err) {
+      return send(res, 409, { error: err instanceof Error ? err.message : "mint failed" });
+    }
+  }
+
+  // A pay run that settles in mock USDT on testnet instead of the wired rail.
+  // Policy, approvals, ledger, receipts and notifications are the real loop —
+  // only the adapters differ — and the run carries sourceRef "testnet" so mock
+  // settlements are never mistaken for mainnet money in the books.
+  if (method === "POST" && url.pathname === "/v1/testnet/pay-runs") {
+    if (!deps.testnet) return send(res, 400, { error: "testnet services not configured" });
+    const adapters = deps.testnet.adapters();
+    if (!adapters) return send(res, 409, { error: "register a testnet wallet first" });
+    const body = (await readJson(req)) as PayRunRequest;
+    const orgId = access.org(body.orgId);
+    if (!orgId) return notFound(res);
+    const result = await createPayRun(store, deps, { ...body, orgId, sourceRef: "testnet" }, adapters);
+    if ("error" in result) return send(res, 400, result);
+    return send(res, 201, result);
+  }
+
+  // NEP-366 gas relay: a payee (or agent) that holds no NEAR signs a delegate
+  // action and posts it here; the relayer verifies the signature, checks it
+  // against the policy and assembles the outer transaction. It never claims a
+  // broadcast it did not make.
+  if (method === "POST" && url.pathname === "/v1/relay") {
+    if (!deps.relayer) return send(res, 400, { error: "relayer not configured" });
+    const body = (await readJson(req)) as { signedDelegateAction?: string };
+    if (typeof body.signedDelegateAction !== "string" || body.signedDelegateAction.length === 0) {
+      return send(res, 400, { error: "signedDelegateAction (base64 borsh) is required" });
+    }
+    const outcome = deps.relayer.handle(body.signedDelegateAction);
+    // A rejection is the caller's problem to fix, so it is a 400; a planned
+    // relay is a 200 carrying the honest "assembled but not broadcast" note.
+    return send(res, outcome.status === "planned" ? 200 : 400, outcome);
+  }
+
+  // The origin chains a cross-chain deposit can be priced from. Static, so the
+  // console can render the chooser without a network round trip.
+  if (method === "GET" && url.pathname === "/v1/funding/chains") {
+    return send(res, 200, FUNDING_CHAINS.map(({ chain, asset, symbol, label }) => ({ chain, asset, symbol, label })));
+  }
+
+  // Price a cross-chain deposit into the treasury with a real 1Click dry quote.
+  // This is the only Intents path that is live (no partner key, no funds at
+  // risk); it returns a price and a fee and never a deposit address, so the
+  // simulated funding card can show a real number without implying money moves.
+  if (method === "POST" && url.pathname === "/v1/funding/quote") {
+    if (!deps.live) return send(res, 400, { error: "live services not configured" });
+    const body = (await readJson(req)) as { chain?: string; usdCents?: number; recipient?: string };
+    if (!body.chain) return send(res, 400, { error: "chain is required" });
+    if (typeof body.usdCents !== "number" || !Number.isFinite(body.usdCents) || body.usdCents <= 0) {
+      return send(res, 400, { error: "usdCents must be a positive number" });
+    }
+    const recipient = body.recipient ?? deps.testnet?.account;
+    if (!recipient) return send(res, 400, { error: "recipient is required" });
+    try {
+      const quote = await deps.live.fundingQuote({
+        chain: body.chain,
+        amountUsdCents: Math.round(body.usdCents),
+        recipient,
+      });
+      return send(res, 200, {
+        simulated: true,
+        chain: quote.chain,
+        origin: quote.origin,
+        destination: quote.destination,
+        recipient,
+        preview: quote.preview,
+        note:
+          "Live 1Click price. No deposit address is issued and nothing moves: " +
+          "NEAR Intents and 1Click have no testnet, so this funds mainnet only.",
+      });
+    } catch (err) {
+      return send(res, 502, { error: err instanceof Error ? err.message : "quote failed" });
+    }
+  }
+
   if (method === "GET" && url.pathname === "/v1/approvals") {
-    const orgId = url.searchParams.get("orgId");
+    const orgId = access.org(url.searchParams.get("orgId"));
+    if (!orgId) return notFound(res);
     const status = url.searchParams.get("status");
     const all = [...store.approvals.values()].filter(
-      (a) => (!orgId || a.orgId === orgId) && (!status || a.status === status),
+      (a) => a.orgId === orgId && (!status || a.status === status),
     );
     return send(res, 200, all);
   }
@@ -946,7 +1196,12 @@ async function handle(
   if (method === "POST" && decisionMatch) {
     const [, id, action] = decisionMatch;
     const approval = store.approvals.get(id!);
-    if (!approval) return send(res, 404, { error: "approval not found" });
+    // Approving, rejecting and executing all move or authorise money. An
+    // approval belonging to another org is treated as absent so its id cannot
+    // be probed, and so this cannot be used to release someone else's funds.
+    if (!approval || approval.orgId !== access.principal.orgId) {
+      return send(res, 404, { error: "approval not found" });
+    }
 
     if (action === "approve" || action === "reject") {
       // Only a pending approval can be decided; a second decision is a
@@ -1101,7 +1356,7 @@ async function handle(
     if (!deps.agentpay) return send(res, 400, { error: "no agentpay client configured" });
     const body = (await readJson(req)) as {
       id?: string;
-      orgId: string;
+      orgId?: string;
       payeeId: string;
       resourceUrl: string;
       /** Destination base units the agent must receive. */
@@ -1110,15 +1365,21 @@ async function handle(
       description?: string;
       externalId?: string;
     };
+    const orgId = access.org(body.orgId);
+    if (!orgId) return notFound(res);
     const payee = store.payees.get(body.payeeId);
-    if (!payee) return send(res, 400, { error: `unknown payee ${body.payeeId}` });
-    const policy = activePolicy(store, body.orgId);
+    // The payee must belong to the caller's org too, or this would pay someone
+    // else's contractor out of the caller's books.
+    if (!payee || payee.orgId !== orgId) {
+      return send(res, 400, { error: `unknown payee ${body.payeeId}` });
+    }
+    const policy = activePolicy(store, orgId);
     if (!policy) return send(res, 400, { error: "no active policy for org" });
 
     const taskId = body.id ?? `task_${store.agentTasks.size + 1}`;
     const task: AgentTask = {
       id: taskId,
-      orgId: body.orgId,
+      orgId,
       payeeId: body.payeeId,
       protocol: "x402",
       resourceUrl: body.resourceUrl,
@@ -1137,7 +1398,7 @@ async function handle(
       ...(deps.signer ? { signer: deps.signer } : {}),
       lookupPayee: (id) => store.payees.get(id),
       payeeHasHistory: (id) => (store.payeeHistory.get(id) ?? 0) > 0,
-      spentTodayCents: store.settledTodayCents.get(body.orgId) ?? 0,
+      spentTodayCents: store.settledTodayCents.get(orgId) ?? 0,
     });
 
     // A denial is recorded as a failed task so nothing downstream mistakes it
@@ -1183,8 +1444,9 @@ async function handle(
   }
 
   if (method === "GET" && url.pathname === "/v1/agent-tasks") {
-    const orgId = url.searchParams.get("orgId");
-    const all = [...store.agentTasks.values()].filter((t) => !orgId || t.orgId === orgId);
+    const orgId = access.org(url.searchParams.get("orgId"));
+    if (!orgId) return notFound(res);
+    const all = [...store.agentTasks.values()].filter((t) => t.orgId === orgId);
     return send(res, 200, all);
   }
 
@@ -1192,8 +1454,8 @@ async function handle(
     // A 1099-style roll-up: what each agent payee was paid in a tax year, with
     // the terminal receipt for each payment so a figure can be traced to a
     // transaction rather than taken on trust.
-    const orgId = url.searchParams.get("orgId");
-    if (!orgId) return send(res, 400, { error: "orgId is required" });
+    const orgId = access.org(url.searchParams.get("orgId"));
+    if (!orgId) return notFound(res);
     const year = url.searchParams.get("year") ?? String(new Date().getUTCFullYear());
 
     const rows = new Map<
@@ -1237,8 +1499,8 @@ async function handle(
     // The books, plus the two things that make them checkable: a trial balance
     // that must net to zero per currency, and a content hash that pins the
     // export to an exact set of entries.
-    const orgId = url.searchParams.get("orgId");
-    if (!orgId) return send(res, 400, { error: "orgId is required" });
+    const orgId = access.org(url.searchParams.get("orgId"));
+    if (!orgId) return notFound(res);
     const entries = store.journalEntries.filter((e) => e.orgId === orgId);
 
     // An entry that does not balance is a bug, not a report. Refuse rather than
@@ -1262,5 +1524,374 @@ async function handle(
     });
   }
 
+  // The books as a CSV an accountant can open in a spreadsheet: one row per
+  // posting, so a figure can be filtered by account, currency, or date. Amounts
+  // are written as exact base-unit integers (never floats) with the currency
+  // beside them, and the memo carries the source reference.
+  if (method === "GET" && url.pathname === "/v1/exports/journal.csv") {
+    const orgId = access.org(url.searchParams.get("orgId"));
+    if (!orgId) return notFound(res);
+    const entries = store.journalEntries.filter((e) => e.orgId === orgId);
+    if (!allBalanced(entries)) {
+      return send(res, 500, { error: "ledger contains an unbalanced entry; export refused" });
+    }
+    const rows: string[][] = [["date", "entry_id", "kind", "memo", "account", "direction", "amount", "currency"]];
+    for (const entry of entries) {
+      for (const p of entry.postings) {
+        rows.push([
+          entry.createdAt,
+          entry.id,
+          entry.kind,
+          entry.memo,
+          p.account,
+          p.direction,
+          p.amount.toString(),
+          p.currency,
+        ]);
+      }
+    }
+    return sendCsv(res, "crewpay-journal.csv", rows);
+  }
+
   return send(res, 404, { error: "not found" });
+}
+
+/**
+ * The public, capability-URL view of one invoice. Deliberately narrow: the
+ * amount, what it is for, and whether it is already settled. No customer id, no
+ * org id, no other invoice. A link that leaks exposes one obligation, not a
+ * ledger.
+ */
+function publicInvoiceView(
+  res: ServerResponse,
+  store: Store,
+  deps: ApiDeps,
+  invoiceId: string,
+): void {
+  const invoice = store.invoices.get(invoiceId);
+  if (!invoice) return notFound(res);
+  const payment = store.invoicePayments.get(invoiceId);
+  return send(res, 200, {
+    id: invoice.id,
+    amount: invoice.amount,
+    currency: "USD",
+    lineItems: invoice.lineItems ?? [],
+    ...(invoice.dueDate ? { dueDate: invoice.dueDate } : {}),
+    status: invoice.status,
+    settlementAsset: invoice.settlementAsset,
+    ...(invoice.txHashes && invoice.txHashes.length > 0 ? { txHashes: invoice.txHashes } : {}),
+    ...(invoice.paidAt ? { paidAt: invoice.paidAt } : {}),
+    // The chains the customer can pay from. Every one is a real 1Click corridor
+    // into our NEAR settlement asset, so the list is not decorative.
+    supportedChains: FUNDING_CHAINS.map((c) => ({ chain: c.chain, label: c.label, symbol: c.symbol })),
+    // How to pay from a chain of the customer's choosing, if a session exists.
+    ...(payment
+      ? {
+          payment: {
+            originChain: payment.originChain,
+            destinationChain: payment.destinationChain,
+            destinationAsset: payment.destinationAsset,
+            depositAddress: payment.depositAddress,
+            ...(payment.depositMemo ? { depositMemo: payment.depositMemo } : {}),
+            amountOut: payment.amountOut,
+            deadline: payment.deadline,
+            lastStatus: payment.lastStatus ?? "PENDING_DEPOSIT",
+          },
+        }
+      : {}),
+  });
+}
+
+/**
+ * The customer's payment status. Re-reads 1Click by the deposit address (the
+ * same "the webhook is a claim, the API is truth" rule the Ping webhook uses),
+ * applies a settlement to the invoice exactly once, and reports back.
+ */
+async function publicInvoiceStatus(
+  res: ServerResponse,
+  store: Store,
+  deps: ApiDeps,
+  invoiceId: string,
+): Promise<void> {
+  const invoice = store.invoices.get(invoiceId);
+  if (!invoice) return notFound(res);
+  const payment = store.invoicePayments.get(invoiceId);
+  if (!payment || !deps.live) {
+    return send(res, 200, { status: invoice.status, settled: invoice.status === "paid" });
+  }
+
+  let read: { status: string; raw: string; txHashes: readonly string[]; refundReason?: string };
+  try {
+    read = await deps.live.paymentStatus({
+      depositAddress: payment.depositAddress,
+      ...(payment.depositMemo ? { depositMemo: payment.depositMemo } : {}),
+    });
+  } catch {
+    // 1Click has not seen the deposit address yet, or is briefly unreachable.
+    // Report the last known state rather than inventing a failure.
+    return send(res, 200, { status: invoice.status, rail: payment.lastStatus ?? "PENDING_DEPOSIT" });
+  }
+
+  payment.lastStatus = read.raw;
+
+  // Apply once. A re-read after settlement must not re-open the pay run.
+  if (!payment.settled && read.status === "settled") {
+    payment.settled = true;
+    const updated: Invoice = {
+      ...invoice,
+      status: "paid",
+      paidAt: new Date().toISOString(),
+      ...(read.txHashes.length > 0 ? { txHashes: read.txHashes } : {}),
+    };
+    store.invoices.set(invoice.id, updated);
+    store.invoicePayments.set(invoiceId, payment);
+
+    // A paid invoice opens the pay run through the same policy path as any run.
+    const auto = store.invoicePayRuns.get(invoice.id);
+    if (auto) {
+      await createPayRun(store, deps, {
+        orgId: invoice.orgId,
+        period: new Date().toISOString().slice(0, 7),
+        source: "invoice",
+        sourceRef: invoice.id,
+        origin: auto.origin ?? invoice.settlementAsset,
+        lines: [{ payeeId: auto.payeeId, usdCents: invoice.amount }],
+      });
+    }
+    return send(res, 200, { status: "paid", rail: read.raw, txHashes: read.txHashes, settled: true });
+  }
+
+  if (!payment.settled && read.status === "refunded") {
+    const updated: Invoice = {
+      ...invoice,
+      status: "refunded",
+      ...(read.refundReason ? { refundReason: read.refundReason } : {}),
+    };
+    store.invoices.set(invoice.id, updated);
+  }
+
+  store.invoicePayments.set(invoiceId, payment);
+  return send(res, 200, {
+    status: store.invoices.get(invoice.id)?.status ?? invoice.status,
+    rail: read.raw,
+    txHashes: read.txHashes,
+    settled: payment.settled,
+  });
+}
+
+/**
+ * Open a payment session for an invoice: price the corridor from the customer's
+ * chosen chain into our NEAR settlement asset and mint a 1Click deposit address.
+ * This is a real 1Click quote — the address is live and settles to us — so it is
+ * rate-limited per invoice and refused once the invoice is paid.
+ */
+async function publicInvoiceQuote(
+  res: ServerResponse,
+  store: Store,
+  deps: ApiDeps,
+  invoiceId: string,
+  body: { originChain?: string; amountUsdCents?: number },
+): Promise<void> {
+  const invoice = store.invoices.get(invoiceId);
+  if (!invoice) return notFound(res);
+  if (invoice.status === "paid") return send(res, 409, { error: "invoice already paid" });
+  if (!deps.live) return send(res, 400, { error: "live payment services not configured" });
+  const recipient = deps.testnet?.account;
+  if (!recipient) return send(res, 400, { error: "no settlement account configured" });
+  const originChain = (body.originChain ?? "").trim();
+  if (!originChain) return send(res, 400, { error: "originChain is required" });
+
+  // An existing session that has not expired and matches the chain is reused, so
+  // refreshing the page does not mint a new address (and a new obligation) each
+  // time. A different chain, or an expired address, re-quotes.
+  const existing = store.invoicePayments.get(invoiceId);
+  const stillLive = existing && Date.parse(existing.deadline) > Date.now() + 60_000;
+  if (existing && stillLive && existing.originChain === originChain) {
+    return send(res, 200, {
+      reused: true,
+      originChain: existing.originChain,
+      destinationChain: existing.destinationChain,
+      destinationAsset: existing.destinationAsset,
+      depositAddress: existing.depositAddress,
+      ...(existing.depositMemo ? { depositMemo: existing.depositMemo } : {}),
+      amountOut: existing.amountOut,
+      deadline: existing.deadline,
+      correlationId: existing.correlationId,
+    });
+  }
+
+  const amountUsdCents = body.amountUsdCents ?? invoice.amount;
+  if (amountUsdCents !== invoice.amount) {
+    return send(res, 400, { error: "amount must equal the invoice total" });
+  }
+
+  try {
+    const { quote, chain } = await deps.live.paymentQuote({ originChain, amountUsdCents, recipient });
+    const payment: InvoicePayment = {
+      invoiceId,
+      originChain: chain.chain,
+      destinationChain: "near",
+      destinationAsset: "usdt",
+      recipient,
+      amountOut: quote.amountOut,
+      depositAddress: quote.depositAddress,
+      ...(quote.depositMemo ? { depositMemo: quote.depositMemo } : {}),
+      deadline: quote.deadline,
+      correlationId: quote.correlationId,
+      createdAt: new Date().toISOString(),
+      settled: false,
+      lastStatus: "PENDING_DEPOSIT",
+    };
+    store.invoicePayments.set(invoiceId, payment);
+    return send(res, 200, {
+      reused: false,
+      originChain: payment.originChain,
+      destinationChain: payment.destinationChain,
+      destinationAsset: payment.destinationAsset,
+      depositAddress: payment.depositAddress,
+      ...(payment.depositMemo ? { depositMemo: payment.depositMemo } : {}),
+      amountIn: quote.amountIn,
+      ...(quote.amountInFormatted ? { amountInFormatted: quote.amountInFormatted } : {}),
+      amountOut: quote.amountOut,
+      ...(quote.amountOutFormatted ? { amountOutFormatted: quote.amountOutFormatted } : {}),
+      ...(typeof quote.timeEstimate === "number" ? { timeEstimate: quote.timeEstimate } : {}),
+      deadline: payment.deadline,
+      correlationId: payment.correlationId,
+    });
+  } catch (err) {
+    return send(res, 502, { error: err instanceof Error ? err.message : "quote failed" });
+  }
+}
+
+/**
+ * Ping's webhook. Public by necessity: Ping cannot present a bearer token,
+ * so this is authenticated by the HMAC over the raw body instead. A bad
+ * signature throws out of `verifyWebhook` and becomes a 500 — never a 2xx,
+ * which would tell Ping the event was handled.
+ */
+async function handlePingWebhook(
+  req: IncomingMessage,
+  res: ServerResponse,
+  store: Store,
+  deps: ApiDeps,
+): Promise<void> {
+  if (!deps.pingpay) return send(res, 400, { error: "no pingpay client configured" });
+  // The raw body is what the signature covers. Re-serialising parsed JSON
+  // would change whitespace and key order and break the HMAC.
+  const raw = await readRaw(req);
+  const event = deps.pingpay.verifyWebhook(raw, {
+    ...(typeof req.headers["x-ping-signature"] === "string"
+      ? { signature: req.headers["x-ping-signature"] }
+      : {}),
+    ...(typeof req.headers["x-ping-timestamp"] === "string"
+      ? { timestamp: req.headers["x-ping-timestamp"] }
+      : {}),
+  }) as unknown as PingWebhookEvent;
+
+  // Ping retries until it gets a 2xx, so the same event can arrive twice.
+  // Acknowledging a duplicate without acting is what makes that safe.
+  if (store.webhookEvents.has(event.id)) {
+    return send(res, 200, { received: true, duplicate: true, eventId: event.id });
+  }
+  store.webhookEvents.set(event.id, { type: event.type, at: new Date().toISOString() });
+
+  const invoice = [...store.invoices.values()].find(
+    (i) => i.checkoutSessionId === event.resourceId || i.paymentId === event.resourceId,
+  );
+  if (!invoice) {
+    // Nothing of ours matches. Acknowledge so Ping stops retrying, but say so.
+    return send(res, 200, { received: true, matched: false, eventId: event.id });
+  }
+
+  if (event.type === "checkout.session.completed") {
+    // The webhook is a claim; the session is the truth. Ask Ping before
+    // releasing money, so a forged-but-signed-elsewhere or replayed event
+    // cannot mark an unpaid invoice as paid.
+    const session = await deps.pingpay.getCheckout(invoice.checkoutSessionId);
+    const status = invoiceStatusFor(session.status);
+    const txHashes = extractTxHashes(event.data);
+    const updated: Invoice = {
+      ...invoice,
+      status,
+      ...(session.paymentId ? { paymentId: session.paymentId } : {}),
+      ...(txHashes.length > 0 ? { txHashes } : {}),
+      ...(status === "paid" ? { paidAt: new Date().toISOString() } : {}),
+    };
+    store.invoices.set(invoice.id, updated);
+
+    if (status !== "paid") {
+      return send(res, 200, { received: true, invoice: updated, note: "session not completed at Ping" });
+    }
+
+    const auto = store.invoicePayRuns.get(invoice.id);
+    if (!auto) return send(res, 200, { received: true, invoice: updated });
+
+    // Paid: open the pay run that pays the contractor out of the proceeds.
+    const payRun = await createPayRun(store, deps, {
+      orgId: invoice.orgId,
+      period: new Date().toISOString().slice(0, 7),
+      source: "invoice",
+      sourceRef: invoice.id,
+      origin: auto.origin ?? invoice.settlementAsset,
+      lines: [{ payeeId: auto.payeeId, usdCents: invoice.amount }],
+    });
+    return send(res, 200, { received: true, invoice: updated, payRun });
+  }
+
+  // A payment that is in flight but not final: `pending`, not `paid`. The
+  // distinction is the whole point — an operator must not treat "sent" as
+  // "cleared", and a pay run is never released on a pending payment.
+  if (event.type === "payment.pending") {
+    const txHashes = extractTxHashes(event.data);
+    const updated: Invoice = {
+      ...invoice,
+      status: "pending",
+      ...(txHashes.length > 0 ? { txHashes } : {}),
+    };
+    store.invoices.set(invoice.id, updated);
+    return send(res, 200, { received: true, invoice: updated });
+  }
+
+  if (event.type === "payment.success") {
+    // Re-read the payment before releasing: the event is a claim.
+    const payment = invoice.paymentId ? await deps.pingpay.getPayment?.(invoice.paymentId) : undefined;
+    const status = payment ? invoiceStatusForPayment(payment.status) : "paid";
+    const txHashes = extractTxHashes(event.data);
+    const updated: Invoice = {
+      ...invoice,
+      status,
+      ...(txHashes.length > 0 ? { txHashes } : {}),
+      ...(status === "paid" ? { paidAt: new Date().toISOString() } : {}),
+    };
+    store.invoices.set(invoice.id, updated);
+    return send(res, 200, { received: true, invoice: updated });
+  }
+
+  if (event.type === "checkout.session.expired" || event.type === "payment.failed") {
+    const status: InvoiceStatus = event.type === "payment.failed" ? "failed" : "expired";
+    const updated: Invoice = { ...invoice, status };
+    store.invoices.set(invoice.id, updated);
+    return send(res, 200, { received: true, invoice: updated });
+  }
+
+  return send(res, 200, { received: true, ignored: event.type, eventId: event.id });
+}
+
+/**
+ * Pull transaction hashes out of a Ping webhook's free-form `data` bag. Ping
+ * documents `data` as "anything", so this accepts the plausible spellings and
+ * returns nothing when it finds none — an invoice with no traceable tx is
+ * honest; a fabricated one is not.
+ */
+function extractTxHashes(data: Record<string, unknown> | undefined): string[] {
+  if (!data) return [];
+  const out: string[] = [];
+  const push = (v: unknown): void => {
+    if (typeof v === "string" && v.trim()) out.push(v.trim());
+    else if (Array.isArray(v)) for (const item of v) push(item);
+  };
+  for (const key of ["txHash", "tx_hash", "transactionHash", "transaction_hash", "hash", "txHashes", "hashes"]) {
+    if (key in data) push(data[key]);
+  }
+  return [...new Set(out)];
 }

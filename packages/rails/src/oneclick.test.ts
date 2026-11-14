@@ -128,6 +128,27 @@ test("dry mode is opt-in and off by default, so a real run never mints a fake ad
   assert.equal((dry.calls[0]!.body as Record<string, unknown>).dry, true);
 });
 
+test("preview prices a corridor dry, with no deposit address in the result", async () => {
+  const { fn, calls } = mockFetch([{ body: QUOTE_RESPONSE }]);
+  const preview = await rail(fn).preview({
+    origin: BASE_USDC,
+    destination: NEAR_USDC,
+    amount: 150_000_000n,
+    recipient: "ada.near",
+    refundTo: "0x0000000000000000000000000000000000000001",
+  });
+  const body = calls[0]!.body as Record<string, unknown>;
+  assert.equal(body.dry, true, "a preview must never ask 1Click for a live quote");
+  assert.equal(body.amount, "150000000");
+  assert.equal(body.refundTo, "0x0000000000000000000000000000000000000001");
+  // The preview carries a price and a fee, and nothing funds can be sent to.
+  assert.equal(preview.amountIn, "1501000000");
+  assert.equal(preview.amountOut, "1500000000");
+  assert.equal(preview.withdrawFee, "100000");
+  assert.equal(preview.timeEstimate, 120);
+  assert.ok(!("depositAddress" in preview), "a preview must not expose a deposit address");
+});
+
 test("quote parses the response into typed bigints and keeps the signature", async () => {
   const { fn } = mockFetch([{ body: QUOTE_RESPONSE }]);
   const quote = await rail(fn).quote(op());
