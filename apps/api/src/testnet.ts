@@ -66,6 +66,13 @@ export interface TestnetServicesConfig {
    * only (tests). The file is written 0600 and is never logged or served.
    */
   readonly statePath?: string;
+  /**
+   * A wallet `wk_` key from the environment (a secret store on hosted
+   * platforms, where the state file does not survive a deploy). Tried when no
+   * state file holds a working key: a valid key is held and persisted, an
+   * invalid one is ignored and a fresh wallet is minted.
+   */
+  readonly restoreApiKey?: string;
 }
 
 interface HeldWallet {
@@ -81,6 +88,7 @@ export class TestnetServices {
   private readonly rpcUrl: string;
   private readonly fetchImpl: typeof fetch;
   private readonly statePath: string | undefined;
+  private readonly restoreApiKey: string | undefined;
   private readonly priceOutbound: PriceSource | undefined;
   private wallet?: HeldWallet;
   /** Setup steps already attempted, so prepare is idempotent across calls. */
@@ -93,6 +101,7 @@ export class TestnetServices {
     this.fetchImpl = ((input: string | URL | Request, init?: RequestInit) =>
       inner(input, { ...init, signal: AbortSignal.timeout(TIMEOUT_MS) })) as typeof fetch;
     this.statePath = cfg.statePath;
+    this.restoreApiKey = cfg.restoreApiKey;
     this.priceOutbound = cfg.priceOutbound;
   }
 
@@ -102,9 +111,10 @@ export class TestnetServices {
 
   /**
    * Register a testnet wallet: reuse the persisted one when a state file holds
-   * a key, otherwise ask OutLayer for a new wallet and persist the key. OutLayer
-   * mints a fresh account per register call, so without this the funded account
-   * — and any gas sent to it — is orphaned on every restart.
+   * a key, else the environment-supplied key when one is configured, else ask
+   * OutLayer for a new wallet and persist the key. OutLayer mints a fresh
+   * account per register call, so without this the funded account — and any gas
+   * sent to it — is orphaned on every restart.
    */
   async register(): Promise<{ account: string; reused: boolean }> {
     if (this.wallet) return { account: this.wallet.account, reused: true };
@@ -118,6 +128,16 @@ export class TestnetServices {
       }
       // The saved key no longer works (revoked, wrong env): fall through and
       // mint a fresh wallet rather than refuse to start.
+    }
+
+    if (this.restoreApiKey) {
+      const held = await this.hold(this.restoreApiKey).catch(() => undefined);
+      if (held) {
+        this.writeState({ apiKey: this.restoreApiKey, account: held.account });
+        this.wallet = held;
+        return { account: held.account, reused: true };
+      }
+      // The supplied key is invalid: fall through and mint rather than refuse.
     }
 
     const res = await this.fetchImpl(`${this.outlayerUrl}/register`, {

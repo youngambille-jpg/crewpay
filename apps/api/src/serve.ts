@@ -39,8 +39,10 @@ if (!API_TOKEN) {
 const auth: AuthConfig = { tokens: new Map([[API_TOKEN, { orgId: TOKEN_ORG, label: TOKEN_ORG }]]) };
 
 const live = new LiveServices();
+const restoreApiKey = process.env["CREWPAY_TESTNET_API_KEY"];
 const testnet = new TestnetServices({
   statePath: process.env["CREWPAY_TESTNET_STATE"] ?? resolve(process.cwd(), ".data/testnet-wallet.json"),
+  ...(restoreApiKey ? { restoreApiKey } : {}),
   // The cross-chain router prices an outbound corridor through this. It is a
   // keyless 1Click dry quote, so it needs no partner key and moves nothing.
   priceOutbound: live.crossChainPrice(),
@@ -93,7 +95,7 @@ const { server } = createApi(deps);
 await new Promise<void>((resolve) => server.listen(PORT, HOST, resolve));
 console.log(`crewpay api on http://${HOST}:${PORT} (live testnet)`);
 console.log(
-  `testnet wallet: ${testnetAccount} (${testnetReused ? "reused from state" : "freshly minted"})` +
+  `testnet wallet: ${testnetAccount} (${testnetReused ? "reused existing" : "freshly minted"})` +
     ` — needs testnet NEAR gas before it can pay`,
 );
 if (!PING_API_KEY) {

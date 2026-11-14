@@ -1,0 +1,60 @@
+# CrewPay on Render: the control plane plus the operator console.
+#
+# Deploy: Dashboard -> New -> Blueprint -> connect this repo. Render creates
+# both services from this file. The API's bearer token is generated once
+# (generateValue) and the console reads the same value via fromService, so the
+# two processes always share one credential without it ever appearing here.
+#
+# Free-tier notes, stated plainly:
+# - The API is the only stateful part and its store is in-memory: payees, runs
+#   and the journal reset on every deploy or restart. Postgres persistence is
+#   still open work; do not read this deploy as durable hosting for the books.
+# - Without a persistent disk (a paid feature, deliberately not declared here)
+#   the wallet state file does not survive a deploy either. Set
+#   CREWPAY_TESTNET_API_KEY in the dashboard (mint one with
+#   `curl -X POST https://testnet-api.outlayer.ai/register`) and each boot
+#   restores that funded wallet instead of minting a fresh unfunded one.
+# - Free services sleep when idle; the first request after a sleep wakes the
+#   API (~30s, it re-checks the wallet key) and the console after it.
+services:
+  - type: web
+    name: crewpay-api
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm run api
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: CREWPAY_API_TOKEN
+        generateValue: true
+      - key: CREWPAY_ORG_ID
+        value: org_1
+      - key: CREWPAY_TESTNET_API_KEY
+        sync: false
+      - key: PING_API_KEY
+        sync: false
+      - key: PING_WEBHOOK_SECRET
+        sync: false
+
+  - type: web
+    name: crewpay-web
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run web:build
+    startCommand: node apps/web/server.mjs
+    healthCheckPath: /app
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: CREWPAY_API_TOKEN
+        fromService:
+          type: web
+          name: crewpay-api
+          envVarKey: CREWPAY_API_TOKEN
+      - key: API_ORIGIN
+        fromService:
+          type: web
+          name: crewpay-api
+          envVarKey: RENDER_EXTERNAL_URL

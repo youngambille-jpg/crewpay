@@ -262,6 +262,38 @@ test("a stale saved key falls back to a fresh register rather than refusing to s
   assert.equal(saved.apiKey, "wk_testnet_1");
 });
 
+test("an environment-supplied wallet key is restored without minting a new wallet", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "crewpay-wallet-"));
+  const statePath = join(dir, "testnet-wallet.json");
+  const { fn, calls } = mockFetch([{ body: { address: "env.testnet" } }]);
+  const svc = new TestnetServices({ fetchImpl: fn, statePath, restoreApiKey: "wk_env_1" });
+  const restored = await svc.register();
+  assert.equal(restored.account, "env.testnet");
+  assert.equal(restored.reused, true);
+  // Only the address check went out; /register was never called.
+  assert.equal(calls.length, 1);
+  assert.match(calls[0]!.url, /\/wallet\/v1\/address/);
+  const saved = JSON.parse(readFileSync(statePath, "utf8")) as { apiKey: string; account: string };
+  assert.equal(saved.apiKey, "wk_env_1");
+  assert.equal(saved.account, "env.testnet");
+});
+
+test("an invalid environment-supplied key falls back to a fresh register", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "crewpay-wallet-"));
+  const statePath = join(dir, "testnet-wallet.json");
+  const { fn, calls } = mockFetch([
+    { status: 401, body: { error: "unauthorized", message: "bad key" } },
+    { body: registerBody },
+  ]);
+  const svc = new TestnetServices({ fetchImpl: fn, statePath, restoreApiKey: "wk_bogus" });
+  const created = await svc.register();
+  assert.equal(created.account, "w1.testnet");
+  assert.equal(created.reused, false);
+  assert.equal(calls.length, 2); // address check, then register
+  const saved = JSON.parse(readFileSync(statePath, "utf8")) as { apiKey: string };
+  assert.equal(saved.apiKey, "wk_testnet_1");
+});
+
 test("a testnet pay run settles mock USDT through the real loop", async () => {
   const { fn } = mockFetch([
     { body: registerBody },

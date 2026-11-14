@@ -67,7 +67,7 @@ no network and no credentials, so it is reviewable before any rail is wired in.
 | `apps/api` | **done** | 112 | Control plane over `node:http`, in-memory store, bearer-token auth + org ownership |
 | `apps/web` | **done** | 35 | Operator console (TanStack Start + React 19), Payees + Policy + Ledger wired |
 
-**358 tests, `tsc` clean.**
+**365 tests, `tsc` clean.**
 
 ## The three money flows
 
@@ -169,6 +169,25 @@ npm run web:build  # production build of the console
 both servers detached (`setsid`) so they are not reaped when the shell that
 launched them exits — starting them by hand is why the public link goes dead
 between sessions. It is safe to re-run.
+
+### Deploy to Render
+
+`render.yaml` at the repo root is a Blueprint for both processes: Dashboard ->
+New -> Blueprint -> connect this repo. The API's bearer token is generated once
+and the console reads the same value, so the two always share one credential.
+Then, on the `crewpay-api` service only:
+
+1. Mint a testnet wallet key out of band —
+   `curl -X POST https://testnet-api.outlayer.ai/register` — and set it as
+   `CREWPAY_TESTNET_API_KEY`. Without this each deploy mints a fresh unfunded
+   wallet and orphans the gas sent to the old one.
+2. Optionally set `PING_API_KEY` (+ `PING_WEBHOOK_SECRET`) to wire invoices and
+   agent payouts.
+
+Free-tier limits are real: services sleep when idle (first request wakes them),
+and the API's store is in-memory, so payees, runs and the journal reset on
+every deploy or restart. This deploy is for operating the console against live
+testnet, not durable hosting for the books.
 
 `apps/web` is the operator console (TanStack Start + React 19, built with Vite)
 and nothing else: `/` is a door page linking into `/app`. It is the only

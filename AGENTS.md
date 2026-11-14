@@ -627,7 +627,7 @@ export, funding reconciliation into the books, the TanStack operator console
 (Payees, Policy and Ledger wired; pay runs, approvals, invoices and worklist
 still pending), the live connect/policy path
 (`LiveServices`, `live.test.ts`), and bearer-token auth with org ownership.
-358 tests.
+365 tests.
 Not started: Postgres persistence, multi-user identity (the token identifies an
 org, not a person; CORS is still `*`), and on-chain policy storage (needs a
 funded account).
