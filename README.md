@@ -162,7 +162,14 @@ npm run smoke:live     # run the real rails against live services (needs network
 npm run typecheck  # strict tsc, no emit
 npm run web        # landing page + dashboard (Next.js) on http://localhost:3000
 npm run web:build  # production build of the web app
+
+./scripts/redeploy.sh   # build (if needed), start both, verify every route
 ```
+
+`redeploy.sh` is the way to bring the demo up on a fresh container. It starts
+both servers detached (`setsid`) so they are not reaped when the shell that
+launched them exits — starting them by hand is why the public link goes dead
+between sessions. It is safe to re-run.
 
 `apps/web` is the marketing landing page **and the operator dashboard**
 (Next.js 16 + React 19). It is the only component with a build step and the only
