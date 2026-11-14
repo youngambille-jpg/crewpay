@@ -46,6 +46,11 @@ export interface RunDeps {
   readonly lookupPayee: (payeeId: string) => Payee | undefined;
   /** True if the payee has at least one previously settled payment. */
   readonly payeeHasHistory: (payeeId: string) => boolean;
+  /**
+   * USD cents already settled today before this run. Seeds the daily cap so it
+   * holds across runs, not just within one.
+   */
+  readonly spentTodayCents?: number;
 }
 
 /**
@@ -155,7 +160,7 @@ export async function executeRun(
   const denied: string[] = [];
   const failed: string[] = [];
   const needsReview: string[] = [];
-  let spentTodayCents = 0;
+  let spentTodayCents = deps.spentTodayCents ?? 0;
   let settledCents = 0;
 
   for (const { item, operation } of items) {
@@ -231,6 +236,8 @@ export interface ExecuteApprovedResult {
   readonly status: "executed" | "failed" | "needs_review" | "stale";
   readonly approval: Approval;
   readonly journal?: JournalEntry;
+  /** The rail's terminal answer, with the tx evidence the receipt needs. */
+  readonly settlement?: SettlementResult;
   readonly reasons?: readonly string[];
   /**
    * How funding went. Carried on every terminal outcome so the caller can keep
@@ -279,6 +286,7 @@ export async function executeApproved(
       status: "executed",
       approval: { ...approval, status: "executed" },
       journal: result.journal,
+      settlement: result.settlement,
       ...(result.funding ? { funding: result.funding } : {}),
       ...(result.quote ? { quote: result.quote } : {}),
     };
@@ -292,6 +300,7 @@ export async function executeApproved(
         ...(result.funding && result.funding.kind === "failed" ? { note: result.funding.reason } : {}),
         ...(result.settlement?.failureReason ? { note: result.settlement.failureReason } : {}),
       },
+      ...(result.settlement ? { settlement: result.settlement } : {}),
       ...(result.funding ? { funding: result.funding } : {}),
       ...(result.quote ? { quote: result.quote } : {}),
     };
@@ -299,6 +308,7 @@ export async function executeApproved(
   return {
     status: "needs_review",
     approval: { ...approval, status: "executing" },
+    ...(result.settlement ? { settlement: result.settlement } : {}),
     ...(result.funding ? { funding: result.funding } : {}),
     ...(result.quote ? { quote: result.quote } : {}),
   };

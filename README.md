@@ -215,6 +215,9 @@ POST   /v1/payees                      create/upsert a payee
 POST   /v1/policies                    publish a policy version (one active per org)
 POST   /v1/pay-runs                    run a pay run (csv|api|invoice source)
 GET    /v1/pay-runs                    list pay runs
+GET    /v1/pay-runs/:id                run + per-line states, decisions, receipts
+GET    /v1/operations                  operations + policy decisions (?orgId=&status=)
+GET    /v1/notifications               notification outbox (?orgId=)
 GET    /v1/approvals                   approvals inbox (?orgId=&status=)
 POST   /v1/approvals/:id/approve       one-signature approval
 POST   /v1/approvals/:id/reject        reject

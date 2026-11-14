@@ -20,7 +20,7 @@ import type { Signer } from "@crewpay/signer";
 import { compileManifest, diffManifest, type ManifestDrift } from "@crewpay/signer";
 import { executeApproved, executeRun, payAgentTask, resolveFunding } from "@crewpay/agent";
 import { allBalanced, attestation, trialBalance } from "@crewpay/ledger";
-import { activePolicy, createStore, recordFunding, resolveFundingRecord, type Store } from "./store.ts";
+import { activePolicy, createStore, notify, recordFunding, recordOutcome, resolveFundingRecord, type Store } from "./store.ts";
 import { LiveServices, toOutLayerRules } from "./live.ts";
 
 export interface ApiDeps {
@@ -151,8 +151,14 @@ async function createPayRun(
       ...(deps.signer ? { signer: deps.signer } : {}),
       lookupPayee: (id) => store.payees.get(id),
       payeeHasHistory: (id) => (store.payeeHistory.get(id) ?? 0) > 0,
+      // The daily cap is per day, not per run: seed it with what already settled.
+      spentTodayCents: store.settledTodayCents.get(body.orgId) ?? 0,
     },
   );
+
+  // Lines start pending; each outcome below moves its line to a real state.
+  // Pre-storing lets recordOutcome update them in place.
+  store.payRunItems.set(runId, items.map((i) => i.item));
 
   for (const outcome of result.outcomes) {
     if (outcome.settlement?.status === "settled") {
@@ -174,6 +180,80 @@ async function createPayRun(
       },
       outcome.funding,
     );
+
+    const codes = outcome.decision.reasons.map((r) => r.code);
+    const base = {
+      orgId: body.orgId,
+      operationId: outcome.operationId,
+      payeeId: outcome.payeeId,
+      payRunId: runId,
+      decision: outcome.decision.decision,
+      reasonCodes: codes,
+      policyId: outcome.decision.policyId,
+      policyVersion: outcome.decision.policyVersion,
+    };
+    if (outcome.decision.decision === "deny") {
+      recordOutcome(store, { ...base, status: "denied", note: `denied: ${codes.join(", ")}` });
+      notify(store, {
+        orgId: body.orgId,
+        kind: "payee_denied",
+        to: outcome.payeeId,
+        refType: "operation",
+        refId: outcome.operationId,
+        message: `line for ${outcome.payeeId} denied (${codes.join(", ")})`,
+      });
+      continue;
+    }
+    if (outcome.decision.decision === "allow_with_approval") {
+      recordOutcome(store, { ...base, status: "awaiting_approval" });
+      continue;
+    }
+    if (outcome.journal && outcome.settlement?.status === "settled") {
+      recordOutcome(store, {
+        ...base,
+        status: "settled",
+        ...(outcome.settlement.quoteId ? { quoteId: outcome.settlement.quoteId } : {}),
+        ...(outcome.settlement.txHash ? { txHash: outcome.settlement.txHash } : {}),
+        ...(outcome.settlement.evidence ? { evidence: outcome.settlement.evidence } : {}),
+        journalEntryId: outcome.journal.id,
+      });
+      notify(store, {
+        orgId: body.orgId,
+        kind: "payee_paid",
+        to: outcome.payeeId,
+        refType: "operation",
+        refId: outcome.operationId,
+        message: `paid ${outcome.payeeId} (operation ${outcome.operationId})`,
+      });
+    } else if (result.failed.includes(outcome.operationId)) {
+      const reason =
+        outcome.settlement?.failureReason ??
+        (outcome.funding?.kind === "failed" ? outcome.funding.reason : "settlement failed");
+      recordOutcome(store, { ...base, status: "failed", note: reason });
+      notify(store, {
+        orgId: body.orgId,
+        kind: "payout_failed",
+        to: "owner",
+        refType: "operation",
+        refId: outcome.operationId,
+        message: `payout ${outcome.operationId} failed: ${reason}`,
+      });
+    } else {
+      // Unknown fund state or still in flight: submitted somewhere, outcome
+      // unconfirmed. The worklist owns it from here.
+      const reason =
+        outcome.settlement?.failureReason ??
+        (outcome.funding && "reason" in outcome.funding ? outcome.funding.reason : "settlement unresolved");
+      recordOutcome(store, { ...base, status: "submitted", note: reason });
+      notify(store, {
+        orgId: body.orgId,
+        kind: "payout_needs_review",
+        to: "owner",
+        refType: "operation",
+        refId: outcome.operationId,
+        message: `payout ${outcome.operationId} needs review: ${reason}`,
+      });
+    }
   }
   store.settledTodayCents.set(
     body.orgId,
@@ -202,6 +282,14 @@ async function createPayRun(
     };
     store.approvals.set(approval.id, approval);
     approvalIds.push(approval.id);
+    notify(store, {
+      orgId: body.orgId,
+      kind: "approval_needed",
+      to: "owner",
+      refType: "approval",
+      refId: approval.id,
+      message: `approval ${approval.id} needs a decision (operation ${operation.id})`,
+    });
   }
 
   const run: PayRun = {
@@ -222,7 +310,6 @@ async function createPayRun(
     createdAt: new Date().toISOString(),
   };
   store.payRuns.set(runId, run);
-  store.payRunItems.set(runId, items.map((i) => i.item));
 
   return {
     run,
@@ -605,14 +692,42 @@ async function handle(
     return send(res, 200, { received: true, ignored: event.type, eventId: event.id });
   }
 
-  if (method === "GET" && url.pathname === "/v1/invoices") {
-    const orgId = url.searchParams.get("orgId");
-    const all = [...store.invoices.values()].filter((i) => !orgId || i.orgId === orgId);
-    return send(res, 200, all);
+  // One run with its lines, each line carrying its decision record and, once
+  // settled, its receipt. This is the run summary the dashboard renders.
+  if (method === "GET" && url.pathname.startsWith("/v1/pay-runs/")) {
+    const id = decodeURIComponent(url.pathname.slice("/v1/pay-runs/".length));
+    if (!id || id.includes("/")) return send(res, 404, { error: "not found" });
+    const run = store.payRuns.get(id);
+    if (!run) return send(res, 404, { error: "run not found" });
+    const items = (store.payRunItems.get(id) ?? []).map((item) => {
+      const record = item.operationId ? store.operationRecords.get(item.operationId) : undefined;
+      const receipt = item.operationId ? store.receipts.get(item.operationId) : undefined;
+      return { ...item, ...(record ? { record } : {}), ...(receipt ? { receipt } : {}) };
+    });
+    return send(res, 200, { run, items });
   }
 
-  if (method === "GET" && url.pathname === "/v1/pay-runs") {
-    return send(res, 200, [...store.payRuns.values()]);
+  // Every operation with its policy decision and settlement state.
+  if (method === "GET" && url.pathname === "/v1/operations") {
+    const orgId = url.searchParams.get("orgId");
+    const status = url.searchParams.get("status");
+    const rows = [...store.operations.values()]
+      .filter((op) => !orgId || op.orgId === orgId)
+      .map((operation) => {
+        const record = store.operationRecords.get(operation.id);
+        if (status && record?.status !== status) return null;
+        const receipt = store.receipts.get(operation.id);
+        return { operation, ...(record ? { record } : {}), ...(receipt ? { receipt } : {}) };
+      })
+      .filter((r): r is NonNullable<typeof r> => r !== null);
+    return send(res, 200, rows);
+  }
+
+  // The notification outbox: who was told what, and about which money.
+  if (method === "GET" && url.pathname === "/v1/notifications") {
+    const orgId = url.searchParams.get("orgId");
+    const all = store.notifications.filter((n) => !orgId || n.orgId === orgId);
+    return send(res, 200, all);
   }
 
   if (method === "GET" && url.pathname === "/v1/manifest") {
@@ -743,6 +858,36 @@ async function handle(
           store.payeeHistory.set(record.payeeId, (store.payeeHistory.get(record.payeeId) ?? 0) + 1);
         }
       }
+      // A pay-run line closes into the read model too: the decision was
+      // recorded at run time, so only the status and evidence are new. (An
+      // agent-task funding has no operation record; its task already holds the
+      // receipt.)
+      const prior = store.operationRecords.get(record.operationId);
+      if (prior) {
+        recordOutcome(store, {
+          orgId: prior.orgId,
+          operationId: prior.operationId,
+          payeeId: prior.payeeId,
+          ...(prior.payRunId ? { payRunId: prior.payRunId } : {}),
+          decision: prior.decision,
+          reasonCodes: prior.reasonCodes,
+          policyId: prior.policyId,
+          policyVersion: prior.policyVersion,
+          status: "settled",
+          ...(outcome.settlement.quoteId ? { quoteId: outcome.settlement.quoteId } : {}),
+          ...(outcome.settlement.txHash ? { txHash: outcome.settlement.txHash } : {}),
+          ...(outcome.settlement.evidence ? { evidence: outcome.settlement.evidence } : {}),
+          journalEntryId: outcome.journal.id,
+        });
+      }
+      notify(store, {
+        orgId: record.orgId,
+        kind: "payee_paid",
+        to: record.payeeId ?? "owner",
+        refType: "funding_request",
+        refId: requestId,
+        message: `payout ${record.operationId} settled on re-read (request ${requestId})`,
+      });
       resolveFundingRecord(store, requestId, "settled");
       return send(res, 200, {
         resolved: true,
@@ -754,7 +899,31 @@ async function handle(
     }
 
     // Terminal failure: the money is accounted for (refunded, never sent, or a
-    // rail that will not complete), so the question is answered.
+    // rail that will not complete), so the question is answered. The line leaves
+    // its waiting state too.
+    const priorFailed = store.operationRecords.get(record.operationId);
+    if (priorFailed) {
+      recordOutcome(store, {
+        orgId: priorFailed.orgId,
+        operationId: priorFailed.operationId,
+        payeeId: priorFailed.payeeId,
+        ...(priorFailed.payRunId ? { payRunId: priorFailed.payRunId } : {}),
+        decision: priorFailed.decision,
+        reasonCodes: priorFailed.reasonCodes,
+        policyId: priorFailed.policyId,
+        policyVersion: priorFailed.policyVersion,
+        status: "failed",
+        note: outcome.reason,
+      });
+    }
+    notify(store, {
+      orgId: record.orgId,
+      kind: "payout_failed",
+      to: "owner",
+      refType: "funding_request",
+      refId: requestId,
+      message: `payout ${record.operationId} failed on re-read: ${outcome.reason}`,
+    });
     resolveFundingRecord(store, requestId, "failed", outcome.reason);
     return send(res, 200, {
       resolved: true,
@@ -794,6 +963,14 @@ async function handle(
         ...(body.note ? { note: body.note } : {}),
       };
       store.approvals.set(approval.id, decided);
+      notify(store, {
+        orgId: approval.orgId,
+        kind: "approval_decided",
+        to: approval.payeeId,
+        refType: "approval",
+        refId: approval.id,
+        message: `approval ${approval.id} ${action === "approve" ? "approved" : "rejected"} by ${body.decidedBy ?? "unknown"}`,
+      });
       return send(res, 200, decided);
     }
 
@@ -834,6 +1011,82 @@ async function handle(
         (store.settledTodayCents.get(approval.orgId) ?? 0) + approval.operation.usdCents,
       );
       if (result.journal) store.journalEntries.push(result.journal);
+    }
+
+    // The loop moved: carry the outcome into the read model (line state,
+    // decision record, receipt) and tell the audience.
+    const prior = store.operationRecords.get(approval.operationId);
+    const base = {
+      orgId: approval.orgId,
+      operationId: approval.operationId,
+      payeeId: approval.payeeId,
+      ...(prior?.payRunId ? { payRunId: prior.payRunId } : {}),
+      decision: prior?.decision ?? ("allow_with_approval" as const),
+      reasonCodes: prior?.reasonCodes ?? approval.reasonCodes,
+      policyId: prior?.policyId ?? approval.policyId,
+      policyVersion: prior?.policyVersion ?? approval.policyVersion,
+    };
+    if (result.status === "executed" && result.journal) {
+      recordOutcome(store, {
+        ...base,
+        status: "settled",
+        ...(result.settlement?.quoteId ? { quoteId: result.settlement.quoteId } : {}),
+        ...(result.settlement?.txHash ? { txHash: result.settlement.txHash } : {}),
+        ...(result.settlement?.evidence ? { evidence: result.settlement.evidence } : {}),
+        journalEntryId: result.journal.id,
+      });
+      notify(store, {
+        orgId: approval.orgId,
+        kind: "payee_paid",
+        to: approval.payeeId,
+        refType: "approval",
+        refId: approval.id,
+        message: `paid ${approval.payeeId} (approval ${approval.id})`,
+      });
+    } else if (result.status === "failed") {
+      const reason = result.approval.note ?? "execution failed";
+      recordOutcome(store, { ...base, status: "failed", note: reason });
+      notify(store, {
+        orgId: approval.orgId,
+        kind: "payout_failed",
+        to: "owner",
+        refType: "approval",
+        refId: approval.id,
+        message: `payout ${approval.operationId} failed: ${reason}`,
+      });
+    } else if (result.status === "needs_review") {
+      const reason =
+        result.funding && "reason" in result.funding ? result.funding.reason : "execution unresolved";
+      recordOutcome(store, { ...base, status: "submitted", note: reason });
+      notify(store, {
+        orgId: approval.orgId,
+        kind: "payout_needs_review",
+        to: "owner",
+        refType: "approval",
+        refId: approval.id,
+        message: `payout ${approval.operationId} needs review: ${reason}`,
+      });
+    } else {
+      recordOutcome(store, {
+        orgId: approval.orgId,
+        operationId: approval.operationId,
+        payeeId: approval.payeeId,
+        ...(prior?.payRunId ? { payRunId: prior.payRunId } : {}),
+        decision: "deny",
+        reasonCodes: result.reasons ?? [],
+        policyId: policy.id,
+        policyVersion: policy.version,
+        status: "denied",
+        note: "stale: policy now denies this operation",
+      });
+      notify(store, {
+        orgId: approval.orgId,
+        kind: "payee_denied",
+        to: approval.payeeId,
+        refType: "approval",
+        refId: approval.id,
+        message: `approval ${approval.id} went stale: policy now denies this operation`,
+      });
     }
 
     const status = result.status === "executed" ? 200 : 409;

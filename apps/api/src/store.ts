@@ -1,4 +1,4 @@
-import type { AgentTask, Approval, ChainAsset, Invoice, Operation, PayRun, PayRunItem, Payee, Policy } from "@crewpay/domain";
+import type { AgentTask, Approval, ChainAsset, Invoice, Operation, OperationStatus, PayRun, PayRunItem, Payee, Policy } from "@crewpay/domain";
 import type { JournalEntry } from "@crewpay/ledger";
 import type { Quote } from "@crewpay/rails";
 
@@ -34,6 +34,80 @@ export interface Store {
    * is what makes that possible — without it the state is unrecoverable.
    */
   fundingRequests: Map<string, FundingRecord>;
+  /**
+   * The policy decision and settlement state of every pay-run operation, keyed
+   * by operation id. The Operation is the proposed money movement; this is what
+   * the loop decided and did with it, so the outcome survives the request.
+   */
+  operationRecords: Map<string, OperationRecord>;
+  /**
+   * Terminal proof per settled operation, linking the journal entry to its
+   * on-chain evidence. A settlement the books cannot trace to a transaction is
+   * a number someone typed.
+   */
+  receipts: Map<string, SettlementReceipt>;
+  /**
+   * Notification outbox, in insertion order. Delivery (email, webhook push) is
+   * not wired to a provider, so each event is recorded with its audience
+   * instead of being dropped — the log is what a sender would drain.
+   */
+  notifications: Notification[];
+}
+
+/** The policy engine's verdict, restated here so the store stays dependency-free. */
+export type PolicyDecision = "allow" | "allow_with_approval" | "deny";
+
+/**
+ * What the loop decided and did with one operation. Written when the operation
+ * is evaluated and updated as it settles, fails, or waits — the run summary
+ * and the operations list read this, not the transient run result.
+ */
+export interface OperationRecord {
+  readonly operationId: string;
+  readonly orgId: string;
+  readonly payeeId: string;
+  readonly payRunId?: string;
+  readonly decision: PolicyDecision;
+  readonly reasonCodes: readonly string[];
+  readonly policyId: string;
+  readonly policyVersion: number;
+  readonly status: OperationStatus | "pending";
+  readonly quoteId?: string;
+  readonly txHash?: string;
+  readonly evidence?: string;
+  readonly journalEntryId?: string;
+  readonly note?: string;
+  readonly updatedAt: string;
+}
+
+/** Links one journal entry to the chain transaction that settled it. */
+export interface SettlementReceipt {
+  readonly operationId: string;
+  readonly journalEntryId: string;
+  readonly quoteId?: string;
+  readonly txHash?: string;
+  readonly evidence?: string;
+  readonly settledAt: string;
+}
+
+export type NotificationKind =
+  | "payee_paid"
+  | "payee_denied"
+  | "approval_needed"
+  | "approval_decided"
+  | "payout_failed"
+  | "payout_needs_review";
+
+export interface Notification {
+  readonly id: string;
+  readonly orgId: string;
+  readonly kind: NotificationKind;
+  /** Who should hear it: a payee id, or `owner` for the human operator. */
+  readonly to: string;
+  readonly refType: "pay_run" | "operation" | "approval" | "funding_request";
+  readonly refId: string;
+  readonly message: string;
+  readonly createdAt: string;
 }
 
 /**
@@ -95,6 +169,9 @@ export function createStore(): Store {
     agentTasks: new Map(),
     journalEntries: [],
     fundingRequests: new Map(),
+    operationRecords: new Map(),
+    receipts: new Map(),
+    notifications: [],
   };
 }
 
@@ -168,4 +245,95 @@ export function resolveFundingRecord(
     resolvedAt: new Date().toISOString(),
     ...(note ? { resolutionNote: note } : {}),
   });
+}
+
+export interface OutcomeInput {
+  readonly orgId: string;
+  readonly operationId: string;
+  readonly payeeId: string;
+  readonly payRunId?: string;
+  readonly decision: PolicyDecision;
+  readonly reasonCodes: readonly string[];
+  readonly policyId: string;
+  readonly policyVersion: number;
+  readonly status: OperationStatus | "pending";
+  readonly quoteId?: string;
+  readonly txHash?: string;
+  readonly evidence?: string;
+  readonly journalEntryId?: string;
+  readonly note?: string;
+}
+
+/**
+ * Record what the loop did with one operation: the decision, the current
+ * status, and any settlement evidence. A settled outcome also writes the
+ * receipt linking the journal entry to its chain transaction, and the pay-run
+ * line moves to the same status so the run summary is truthful. Later calls
+ * overwrite earlier ones — an approval execution replaces the waiting state,
+ * and a re-resolve repeats the same answer.
+ */
+export function recordOutcome(store: Store, input: OutcomeInput): void {
+  const now = new Date().toISOString();
+  store.operationRecords.set(input.operationId, {
+    operationId: input.operationId,
+    orgId: input.orgId,
+    payeeId: input.payeeId,
+    ...(input.payRunId ? { payRunId: input.payRunId } : {}),
+    decision: input.decision,
+    reasonCodes: [...input.reasonCodes],
+    policyId: input.policyId,
+    policyVersion: input.policyVersion,
+    status: input.status,
+    ...(input.quoteId ? { quoteId: input.quoteId } : {}),
+    ...(input.txHash ? { txHash: input.txHash } : {}),
+    ...(input.evidence ? { evidence: input.evidence } : {}),
+    ...(input.journalEntryId ? { journalEntryId: input.journalEntryId } : {}),
+    ...(input.note ? { note: input.note } : {}),
+    updatedAt: now,
+  });
+  if (input.status === "settled" && input.journalEntryId) {
+    store.receipts.set(input.operationId, {
+      operationId: input.operationId,
+      journalEntryId: input.journalEntryId,
+      ...(input.quoteId ? { quoteId: input.quoteId } : {}),
+      ...(input.txHash ? { txHash: input.txHash } : {}),
+      ...(input.evidence ? { evidence: input.evidence } : {}),
+      settledAt: now,
+    });
+  }
+  for (const [runId, list] of store.payRunItems) {
+    const idx = list.findIndex((i) => i.operationId === input.operationId);
+    if (idx < 0) continue;
+    const current = list[idx]!;
+    const next = [...list];
+    next[idx] = { ...current, state: input.status };
+    store.payRunItems.set(runId, next);
+    break;
+  }
+}
+
+/** Append one event to the notification outbox. */
+export function notify(
+  store: Store,
+  input: {
+    orgId: string;
+    kind: NotificationKind;
+    to: string;
+    refType: Notification["refType"];
+    refId: string;
+    message: string;
+  },
+): Notification {
+  const note: Notification = {
+    id: `ntf_${store.notifications.length + 1}`,
+    orgId: input.orgId,
+    kind: input.kind,
+    to: input.to,
+    refType: input.refType,
+    refId: input.refId,
+    message: input.message,
+    createdAt: new Date().toISOString(),
+  };
+  store.notifications.push(note);
+  return note;
 }

@@ -202,3 +202,16 @@ test("a settlement still in flight after the poll budget is escalated", async ()
   assert.deepEqual(result.failed, []);
   assert.equal(result.settledCents, 0);
 });
+
+test("the daily cap seeds from prior spend across runs", async () => {
+  const p = payee("ada");
+  const d = { ...deps([p]), spentTodayCents: 150_000 };
+  const result = await executeRun(
+    "org_1",
+    policy({ maxDailyCents: 200_000, approvalThresholdCents: 1_000_000 }),
+    [line("op_1", "ada", 150_000)],
+    d,
+  );
+  assert.deepEqual(result.denied, ["op_1"]);
+  assert.equal(result.settledCents, 0);
+});
