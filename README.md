@@ -258,6 +258,27 @@ it those routes answer 400 and the console says so. 1Click prices corridors via
 dry quotes; OutLayer policy compile/dry-run endpoints remain available over the
 API for the custody backstop.
 
+### A payout address must exist on testnet, so it ends in `.testnet`
+
+This deployment pays on NEAR **testnet**, so a payee's payout address must be a
+testnet account. A `.near` address is a *mainnet* account: it does not exist on
+testnet, and an `ft_transfer` to it panics with "The account … is not
+registered". That panic arrives *after* the operation has been approved and
+executed, so the approval lands in `failed` with the panic as its note.
+
+This is easy to get wrong, because the console's payee form takes a free-text
+address and defaults the chain to `near`. Nothing checks the address against the
+network the deployment pays on, so a mainnet address is accepted, stored and
+approved — and only the money path objects, at execution. Verified against
+testnet RPC:
+
+    view_account visualisecrypto.testnet   -> exists (holds mock USDT)
+    view_account visualisecrypto.near      -> UNKNOWN_ACCOUNT
+
+Until the form validates the address against the deployment's network, treat a
+`.near` payout address as a mistake here. The same asymmetry is why
+`/app/testnet` registers recipients by their `.testnet` account.
+
 ### Wallets: two of them, and they are different
 
 There are two wallets in this app and conflating them is the easiest way to
@@ -306,8 +327,12 @@ Two limits are deliberate and are stated in the UI rather than papered over:
 - **The policy is compiled and signed, but not yet stored on-chain.** Storing it
   needs a funded account, so the enclave reports `policy: "none"` and a dry-run
   that passes means *nothing refused it*, not yet that your limits allowed it.
-- **No funds move.** The minted wallet holds nothing, so nothing can be
-  broadcast from it. The rail is the fake one until a funded account is wired.
+- **Funds move, but they are mock USDT on NEAR testnet.** The served path wires
+  the real `CrossChainRail` over `TestnetRail` and an OutLayer testnet signer —
+  no fake adapters — so a settled run means real `usdt.fakes.testnet` moved on
+  chain. The token is a fake and the quote is 1:1 (there is no swap on testnet);
+  runs booked this way carry `sourceRef: "testnet"` so mock settlement is never
+  read as mainnet money. A mainnet corridor is refused by name, never simulated.
 
 The custody handoff URL embeds the wallet's `wk_` API key, so it is never
 serialised to a client: the dashboard links to `/v1/connect/handoff`, which
@@ -417,3 +442,24 @@ is refused rather than silently ignored.
 13. OutLayer `request_completed` webhook — see "Not built" above: the signing
     contract is underspecified, so this waits on confirmation rather than a
     guess.
+14. Guard the money path's inputs, not just its outputs — not started. Two
+    verified cases where a bad input reaches execution and surfaces as a 500
+    instead of a named refusal:
+    - **A `.near` payout address on a testnet deployment.** Accepted by the payee
+      form (free text, chain defaults to `near`), stored and approved, then the
+      `ft_transfer` panics because the account does not exist on testnet. The
+      approval lands in `failed` with the panic as its note. The form should
+      validate the address against the deployment's network (see "A payout
+      address must exist on testnet" above).
+    - **A corridor this deployment cannot fund.** `CrossChainRail.preflight`
+      guards the *destination* chain, but `TestnetSigner` also resolves the
+      *origin* through the mock-asset table, so a run funded from `base:usdc`
+      throws "no testnet mock known for base:usdc" past preflight and returns
+      500. The run form offers `base · USDC` even though this deployment cannot
+      fund it. Preflight should cover the origin too, and the route should pass
+      the rail's status through rather than collapsing to 500.
+
+    Both are the same shape as the PingPay fix: a rejection that should be a
+    named 4xx is leaking out as a 500, so the operator cannot tell which side is
+    wrong. A terminal approval should also render its `note`, so "failed"
+    explains itself instead of looking like the second click was ignored.
