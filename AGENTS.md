@@ -548,6 +548,12 @@ and anonymous write of policy. That is closed.
   `VITE_`/`NEXT_PUBLIC_` token: a value the browser can read is a value an
   attacker can read. `serve.ts` refuses to start without `CREWPAY_API_TOKEN`;
   `scripts/redeploy.sh` generates one for both processes.
+- **Secrets live in a gitignored `.env`, never in the repo.** `PING_API_KEY` and
+  `PING_WEBHOOK_SECRET` belong there; `.env.example` documents the keys.
+  `npm run api` and `npm run smoke:live` load it with
+  `node --env-file-if-exists=.env` (an already-set shell var wins), and
+  `redeploy.sh` sources it with `set -a`. A key committed once stays in history
+  even after a later delete, so the file is ignored from the start.
 - **Never build under a running server.** `vite build` rewrites
   `dist/client/assets/*` with new content hashes and deletes the old files, so a
   server started before the build serves HTML naming assets that no longer exist:

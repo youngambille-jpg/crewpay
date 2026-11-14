@@ -296,7 +296,10 @@ the human. Two people sharing one token are indistinguishable to the API.
 The dashboard never sees the token. `/api/*` is served by a route handler
 (`apps/web/app/api/[...path]/route.ts`) that attaches it server-side, so no
 credential reaches the browser — which is why there is no `NEXT_PUBLIC_` token.
-`scripts/redeploy.sh` generates one and gives it to both processes.
+`scripts/redeploy.sh` generates one and gives it to both processes. It also
+loads a gitignored `.env` if present (see `.env.example`), which is where
+`PING_API_KEY` and `PING_WEBHOOK_SECRET` belong; `npm run api` and
+`npm run smoke:live` load the same file via `node --env-file-if-exists=.env`.
 
 Two limits are deliberate and are stated in the UI rather than papered over:
 

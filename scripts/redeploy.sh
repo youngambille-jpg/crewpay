@@ -24,6 +24,18 @@ LOG_DIR="${LOG_DIR:-/tmp}"
 # in a page, a log line, or the repo.
 export CREWPAY_API_TOKEN="${CREWPAY_API_TOKEN:-$(openssl rand -hex 32)}"
 
+# Load local secrets (.env, gitignored) if present. `set -a` exports everything
+# it defines so the API process inherits PING_API_KEY, PING_WEBHOOK_SECRET and
+# any service overrides. An already-exported value wins: this file is a
+# convenience, never an override of the caller's environment.
+if [ -f "$REPO/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "$REPO/.env"
+  set +a
+  echo "env:        loaded $REPO/.env"
+fi
+
 echo "repo:       $REPO"
 echo "api:        http://127.0.0.1:${API_PORT}"
 echo "web:        http://0.0.0.0:${PORT}  (API_ORIGIN=${API_ORIGIN})"
