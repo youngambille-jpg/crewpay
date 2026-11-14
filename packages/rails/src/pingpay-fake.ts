@@ -31,6 +31,8 @@ export class FakePingPay implements PingPayPort {
   readBackStatus: PingCheckoutStatus | undefined;
   /** Set to make `getCheckout` throw, to exercise the failure path. */
   readBackFails = false;
+  /** Set to make `createCheckout` throw, to exercise the error-status mapping. */
+  createCheckoutError: Error | undefined;
 
   constructor(opts: FakePingPayOptions = {}) {
     this.secret = opts.webhookSecret ?? "whsec_test_secret";
@@ -40,6 +42,7 @@ export class FakePingPay implements PingPayPort {
   }
 
   async createCheckout(input: CreateCheckoutInput): Promise<CheckoutSession> {
+    if (this.createCheckoutError) throw this.createCheckoutError;
     const sessionId = `cs_${++this.counter}`;
     const session: CheckoutSession = {
       sessionId,

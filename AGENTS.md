@@ -228,14 +228,16 @@ or `testnet.api.`, which do not resolve. NEAR Intents do not exist on testnet.
 
 Docs: `https://pingpay.gitbook.io/docs/` — every page has a Markdown twin at
 the same URL plus `.md`, and `llms.txt` indexes them all. API base:
-`https://pay.pingpay.io/api`. Hosted checkout lives at
-`https://checkout.pingpay.io/session/{id}`.
+`https://pay.pingpay.io/api`. The hosted checkout URL is whatever Ping returns
+as `sessionUrl` (live form: `https://pay.pingpay.io/checkout?sessionId={id}`);
+treat it as opaque, not as something to build.
 
-- **Two keys, two jobs — never swap them.** Checkout and payment routes take
-  `x-publishable-key` (`pk_`, public by design, runs in the browser). The Agent
-  Pay facilitator (`/agentpay/x402`, `/agentpay/mpp/charge`) takes `x-api-key`
-  and is called server-side. A `pk_` in the agent config is fine; a secret key
-  in a browser would not be.
+- **Checkout and payment routes take the key as `x-api-key`.** Verified live:
+  `x-api-key` returns 200, `x-publishable-key` returns 401 — so the docs' header
+  name is stale. The same `x-api-key` header carries the org key on the Agent
+  Pay facilitator (`/agentpay/x402`, `/agentpay/mpp/charge`), called
+  server-side. A publishable key in an agent config is fine; a secret key in a
+  browser would not be.
 - **The session URL is opaque.** Ping says to use it exactly as returned and not
   to construct it. We store `sessionUrl` verbatim.
 - **Webhook signature** is HMAC-SHA256 hex over `${timestamp}.${rawBody}`, sent
@@ -253,6 +255,14 @@ the same URL plus `.md`, and `llms.txt` indexes them all. API base:
   `checkout.session.completed`, `checkout.session.expired`. Payload is
   `{ id, type, resourceId, data, createdAt }` — `resourceId` is the session or
   payment id, and `data` is free-form ("anything").
+- **`customerReference` is a key, not a display name.** The live API rejects a
+  space: it must match `/^[a-zA-Z0-9_.:-]+$/` and be at most 128 characters, or
+  `POST /checkout/sessions` answers `400 BAD_REQUEST: Input validation failed`
+  (verified: "Halcyon Labs" fails, "Halcyon-Labs" passes). A merchant's real
+  company name almost always has a space, so derive the reference with
+  `toPingReference()` rather than sending `customerId` through. Nothing
+  correlates on it — the webhook matches by session id — so the invoice keeps
+  the real name and Ping gets a legal key.
 - Webhook endpoints are created in the dashboard, not via the agent API.
 
 ## Agent Pay / x402 notes (read from the docs, not guessed)

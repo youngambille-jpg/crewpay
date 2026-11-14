@@ -17,6 +17,7 @@ import type {
 } from "@crewpay/domain";
 import { defaultRules, corridor, invoiceStatusFor, invoiceStatusForPayment, lineItemAmount } from "@crewpay/domain";
 import type { AgentPayPort, PingPayPort, Relayer, SettlementRail } from "@crewpay/rails";
+import { RailError } from "@crewpay/rails";
 import type { Signer } from "@crewpay/signer";
 import { compileManifest, diffManifest, type ManifestDrift } from "@crewpay/signer";
 import { executeApproved, executeRun, payAgentTask, resolveFunding } from "@crewpay/agent";
@@ -753,13 +754,22 @@ async function handle(
       return send(res, 400, { error: "dueDate must be an ISO date" });
     }
 
-    const session = await deps.pingpay.createCheckout({
-      amount: body.amount,
-      asset,
-      ...(body.successUrl ? { successUrl: body.successUrl } : {}),
-      ...(body.cancelUrl ? { cancelUrl: body.cancelUrl } : {}),
-      customerReference: body.customerId,
-    });
+    // Ping's own status is the honest one to pass through: a 400 is our input,
+    // a 5xx is theirs. Collapsing both to 500 (as the top-level handler would)
+    // hides which side is wrong.
+    let session: Awaited<ReturnType<PingPayPort["createCheckout"]>>;
+    try {
+      session = await deps.pingpay.createCheckout({
+        amount: body.amount,
+        asset,
+        ...(body.successUrl ? { successUrl: body.successUrl } : {}),
+        ...(body.cancelUrl ? { cancelUrl: body.cancelUrl } : {}),
+        customerReference: body.customerId,
+      });
+    } catch (err) {
+      if (err instanceof RailError) return send(res, err.statusCode || 502, { error: err.message });
+      throw err;
+    }
     const invoice: Invoice = {
       id: `inv_${store.invoices.size + 1}`,
       orgId,

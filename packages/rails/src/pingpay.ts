@@ -127,6 +127,22 @@ export function verifyPingWebhook(
 }
 
 /**
+ * Ping's `customerReference` is a key, not a display name: it must match
+ * `/^[a-zA-Z0-9_.:-]+$/` and be at most 128 characters. Verified against the
+ * live API — a space returns `400 BAD_REQUEST: Input validation failed`, which
+ * is exactly what a merchant typing "Halcyon Labs" would hit. So derive the key
+ * instead of rejecting the name. Nothing correlates on it (the webhook matches
+ * by session id), and the invoice keeps the merchant's real `customerId`.
+ */
+export function toPingReference(customerId: string): string {
+  const slug = customerId
+    .trim()
+    .replace(/[^a-zA-Z0-9_.:-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug.slice(0, 128) || "customer";
+}
+
+/**
  * Thin client for Ping's API. It owns the two auth headers and the webhook
  * secret, so no caller has to remember which key goes where.
  */
@@ -155,7 +171,7 @@ export class PingPayClient implements PingPayPort {
       asset: { chain: input.asset.chain.toUpperCase(), symbol: input.asset.asset.toUpperCase() },
       ...(input.successUrl ? { successUrl: input.successUrl } : {}),
       ...(input.cancelUrl ? { cancelUrl: input.cancelUrl } : {}),
-      ...(input.customerReference ? { customerReference: input.customerReference } : {}),
+      ...(input.customerReference ? { customerReference: toPingReference(input.customerReference) } : {}),
       ...(input.metadata ? { metadata: input.metadata } : {}),
       ...(input.displayMode ? { displayMode: input.displayMode } : {}),
     };

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
-import { FakeRail, FakePingPay, FakeAgentPay, Relayer } from "@crewpay/rails";
+import { FakeRail, FakePingPay, FakeAgentPay, Relayer, RailError } from "@crewpay/rails";
 import { FakeSigner } from "@crewpay/signer";
 import { defaultRules } from "@crewpay/domain";
 import { createApi } from "./server.ts";
@@ -753,6 +753,32 @@ test("invoices are off when no pingpay client is configured", async () => {
   try {
     const res = await started.call("/v1/invoices", "POST", { orgId: "org_1", customerId: "acme", amount: 100 });
     assert.equal(res.status, 400);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("a Ping validation error surfaces as its real status, not a blanket 500", async () => {
+  const pingpay = pingApi();
+  // What Ping returns for a customerReference that fails its regex.
+  pingpay.createCheckoutError = new RailError("pingpay", 400, "BAD_REQUEST: Input validation failed");
+  const started = await start({ pingpay });
+  try {
+    const res = await started.call("/v1/invoices", "POST", { orgId: "org_1", customerId: "acme", amount: 100 });
+    assert.equal(res.status, 400);
+    assert.match(String(res.json["error"]), /Input validation failed/);
+  } finally {
+    started.server.close();
+  }
+});
+
+test("a Ping outage surfaces as 502, so the cause is not hidden", async () => {
+  const pingpay = pingApi();
+  pingpay.createCheckoutError = new RailError("pingpay", 503, "SERVICE_UNAVAILABLE: upstream down");
+  const started = await start({ pingpay });
+  try {
+    const res = await started.call("/v1/invoices", "POST", { orgId: "org_1", customerId: "acme", amount: 100 });
+    assert.equal(res.status, 503);
   } finally {
     started.server.close();
   }

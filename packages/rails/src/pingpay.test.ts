@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { PingPayClient, WebhookVerificationError } from "./pingpay.ts";
+import { PingPayClient, WebhookVerificationError, toPingReference } from "./pingpay.ts";
 import { FakePingPay } from "./pingpay-fake.ts";
 
 const SECRET = "whsec_test_secret";
@@ -145,4 +145,34 @@ test("the fake signs events that the real verifier accepts", () => {
   const { body, headers } = fake.signEvent({ id: "evt_2", type: "checkout.session.completed" });
   const event = client().verifyWebhook(body, headers);
   assert.equal(event["id"], "evt_2");
+});
+
+// Ping's `customerReference` must match /^[a-zA-Z0-9_.:-]+$/ and be <=128
+// chars. A merchant typing a normal company name breaks that rule, which is the
+// bug this fixes: the reference is derived, not passed through.
+test("toPingReference makes a display name a legal Ping key", () => {
+  assert.equal(toPingReference("Halcyon Labs"), "Halcyon-Labs");
+  assert.equal(toPingReference("  Acme   Inc.  "), "Acme-Inc.");
+  assert.equal(toPingReference("Café & Co"), "Caf-Co");
+  assert.equal(toPingReference("acme_123.v2:eu"), "acme_123.v2:eu");
+});
+
+test("toPingReference never emits an empty reference or one over 128 chars", () => {
+  assert.equal(toPingReference("   "), "customer");
+  assert.equal(toPingReference("!!!"), "customer");
+  const long = toPingReference("x".repeat(200));
+  assert.equal(long.length, 128);
+  assert.match(long, /^[a-zA-Z0-9_.:-]+$/);
+});
+
+test("createCheckout derives a legal customerReference from a name with a space", async () => {
+  let body: Record<string, unknown> | undefined;
+  const fetchImpl = async (_url: string | URL, init?: RequestInit) => {
+    body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return new Response(JSON.stringify({ session: { sessionId: "cs_1", status: "CREATED" } }), { status: 200 });
+  };
+  const c = client({ fetchImpl: fetchImpl as unknown as typeof fetch });
+  await c.createCheckout({ amount: 100, asset: { chain: "near", asset: "usdc" }, customerReference: "Halcyon Labs" });
+  assert.equal(body!["customerReference"], "Halcyon-Labs");
+  assert.match(String(body!["customerReference"]), /^[a-zA-Z0-9_.:-]+$/);
 });
